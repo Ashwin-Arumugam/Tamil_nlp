@@ -35,7 +35,6 @@ if 'username' not in st.session_state:
     st.stop()
 
 # --- DATA LOADING ---
-@st.cache_data(ttl=10)
 def load_and_group_data():
     master_df = conn.read(worksheet="merged_master_sentences")
     unique_sentences = master_df['incorrect'].unique().tolist()
