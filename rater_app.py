@@ -55,19 +55,33 @@ if "username" not in st.session_state:
 # LOAD MASTER DATA
 # =========================================================
 
-@st.cache_data(ttl=300)
+@st.cache_data(show_spinner=False)
 def load_and_group_data():
     df = conn.read(worksheet=MASTER_SHEET_GID)
+
+    if df is None or df.empty:
+        raise ValueError("Master sheet is empty or not accessible.")
+
     df = df.dropna(how="all")
+
+    if "incorrect" not in df.columns:
+        raise KeyError(
+            f"'incorrect' column not found. Columns available: {df.columns.tolist()}"
+        )
+
     unique_sentences = df["incorrect"].unique().tolist()
+
     return df, unique_sentences
 
 
 try:
     master_df, unique_list = load_and_group_data()
+    st.success("Master sheet loaded successfully ✅")
 except Exception as e:
-    st.error("Failed to load master sheet.")
+    st.error("REAL ERROR BELOW ⬇️")
+    st.exception(e)
     st.stop()
+
 
 # =========================================================
 # HELPER FUNCTIONS
