@@ -6,11 +6,7 @@ import uuid
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Model Comparison Tool", layout="wide")
-conn = st.connection(
-    "gsheets",
-    type=GSheetsConnection,
-    spreadsheet="https://docs.google.com/spreadsheets/d/1dGezbW4U83WZDoHX0hI7X-fclMNrP7wRO9T-twmvuKE"
-)
+conn = st.connection("gsheets", type=GSheetsConnection)
 
 MODEL_MAP = {
     "A": "qwen", 
