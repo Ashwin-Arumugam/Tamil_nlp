@@ -9,7 +9,6 @@ st.set_page_config(page_title="Model Comparison Tool", layout="wide")
 conn = st.connection(
     "gsheets",
     type=GSheetsConnection,
-    credentials=st.secrets["gcp_service_account"],
     spreadsheet="https://docs.google.com/spreadsheets/d/1dGezbW4U83WZDoHX0hI7X-fclMNrP7wRO9T-twmvuKE"
 )
 
