@@ -32,7 +32,6 @@ if "username" not in st.session_state:
     st.stop()
 
 # ---------------- LOAD DATA ----------------
-@st.cache_data
 def load_master():
     df = conn.read(worksheet_id=MASTER_SHEET_GID)
     df["incorrect"] = df["incorrect"].astype(str)
