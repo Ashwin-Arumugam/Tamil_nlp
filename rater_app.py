@@ -60,7 +60,7 @@ def load_and_group_data():
     df = conn.read(worksheet=MASTER_SHEET_GID)
 
     if df is None or df.empty:
-        raise ValueError("Master sheet is empty or not accessible.")
+        raise ValueError("Master sheet is empty or not accessible")
 
     df = df.dropna(how="all")
 
@@ -70,8 +70,8 @@ def load_and_group_data():
         )
 
     unique_sentences = df["incorrect"].unique().tolist()
-
     return df, unique_sentences
+
 
 
 try:
@@ -89,7 +89,7 @@ except Exception as e:
 
 def get_existing_rating(m_id, u_idx):
     try:
-        df_check = conn.read(worksheet=MODEL_SHEET_GIDS[m_id])
+        df_check = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
         if not df_check.empty and "unique_set_index" in df_check.columns:
             match = df_check[
                 (df_check["unique_set_index"] == u_idx)
@@ -157,7 +157,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         )
 
         try:
-            df_user = conn.read(worksheet=USER_CORRECTION_GID)
+            df_user = conn.read(worksheet_id=USER_CORRECTION_GID)
 
             if not df_user.empty and "unique_set_index" in df_user.columns:
                 mask = (
@@ -171,7 +171,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         except:
             updated_user_df = user_entry
 
-        conn.update(worksheet=USER_CORRECTION_GID, data=updated_user_df)
+        conn.update(worksheet_id=USER_CORRECTION_GID, data=updated_user_df)
 
 
 # =========================================================
