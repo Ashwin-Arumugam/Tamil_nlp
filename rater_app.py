@@ -125,7 +125,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         )
 
         try:
-            existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
+            existing_df = conn.read(worksheet=MODEL_SHEET_GIDS[m_id])
 
             if not existing_df.empty and "unique_set_index" in existing_df.columns:
                 mask = (
