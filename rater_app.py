@@ -57,7 +57,7 @@ if "username" not in st.session_state:
 
 @st.cache_data(show_spinner=False)
 def load_and_group_data():
-    df = conn.read(worksheet=MASTER_SHEET_GID)
+    df = conn.read(worksheet_id=MASTER_SHEET_GID)
 
     if df is None or df.empty:
         raise ValueError("Master sheet is empty or not accessible")
@@ -125,7 +125,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         )
 
         try:
-            existing_df = conn.read(worksheet=MODEL_SHEET_GIDS[m_id])
+            existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
 
             if not existing_df.empty and "unique_set_index" in existing_df.columns:
                 mask = (
@@ -139,7 +139,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         except:
             updated_df = new_entry
 
-        conn.update(worksheet=MODEL_SHEET_GIDS[m_id], data=updated_df)
+        conn.update(worksheet_id=MODEL_SHEET_GIDS[m_id], data=updated_df)
 
     # Save manual correction
     if manual_fix.strip():
@@ -294,7 +294,7 @@ with st.sidebar:
     st.header("Leaderboard")
 
     try:
-        prog_df = conn.read(worksheet=MODEL_SHEET_GIDS["A"])
+        prog_df = conn.read(worksheet_id=MODEL_SHEET_GIDS["A"])
         if not prog_df.empty:
             stats = (
                 prog_df.groupby("user")["submission_id"]
