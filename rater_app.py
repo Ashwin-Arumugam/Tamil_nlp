@@ -91,13 +91,17 @@ def get_existing_rating(m_id, u_idx):
     """Checks the locally cached data instead of calling the API every frame."""
     df_check = st.session_state.existing_data.get(m_id)
     if df_check is not None and not df_check.empty:
-        if "unique_set_index" in df_check.columns:
+        # Defensive check: only filter if columns exist
+        if "unique_set_index" in df_check.columns and "user" in df_check.columns:
             match = df_check[
                 (df_check["unique_set_index"].astype(str) == str(u_idx))
                 & (df_check["user"] == st.session_state.username)
             ]
             if not match.empty:
-                return int(match.iloc[0]["rating"])
+                try:
+                    return int(match.iloc[0]["rating"])
+                except:
+                    return None
     return None
 
 def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fix):
@@ -120,13 +124,16 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
 
         try:
             # We must read right before write to ensure no data loss, but we add a pause
-            time.sleep(0.5) # Short sleep to avoid hitting 60 req/min
+            time.sleep(0.6) # Slightly longer sleep to avoid hitting 60 req/min
             existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id], ttl=0)
             
             if existing_df is not None and not existing_df.empty:
-                mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
-                       (existing_df["user"] == st.session_state.username)
-                existing_df = existing_df[~mask]
+                # Defensive check: only filter if columns exist to avoid KeyError
+                if "unique_set_index" in existing_df.columns and "user" in existing_df.columns:
+                    mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
+                           (existing_df["user"] == st.session_state.username)
+                    existing_df = existing_df[~mask]
+                
                 updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
             else:
                 updated_df = new_entry
@@ -138,7 +145,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
             st.session_state.existing_data[m_id] = updated_df
 
         except Exception as e:
-            st.error(f"Failed to update sheet for Model {m_id}: {e}")
+            st.error(f"Failed to update sheet for Model {m_id}: {str(e)}")
 
     # 2. Save User Manual Correction
     if manual_fix.strip():
@@ -151,12 +158,14 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         }])
 
         try:
-            time.sleep(0.5)
+            time.sleep(0.6)
             df_user = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
             if df_user is not None and not df_user.empty:
-                mask = (df_user["unique_set_index"].astype(str) == str(u_idx)) & \
-                       (df_user["user"] == st.session_state.username)
-                df_user = df_user[~mask]
+                # Defensive check for user correction tab
+                if "unique_set_index" in df_user.columns and "user" in df_user.columns:
+                    mask = (df_user["unique_set_index"].astype(str) == str(u_idx)) & \
+                           (df_user["user"] == st.session_state.username)
+                    df_user = df_user[~mask]
                 updated_user_df = pd.concat([df_user, user_entry], ignore_index=True)
             else:
                 updated_user_df = user_entry
@@ -164,7 +173,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
             updated_user_df = updated_user_df.fillna("")
             conn.update(worksheet_id=USER_CORRECTION_GID, data=updated_user_df)
         except Exception as e:
-            st.error(f"Failed to update manual correction sheet: {e}")
+            st.error(f"Failed to update manual correction sheet: {str(e)}")
 
 # =========================================================
 # SESSION STATE
