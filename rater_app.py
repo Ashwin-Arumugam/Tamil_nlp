@@ -58,26 +58,21 @@ if "username" not in st.session_state:
 @st.cache_data(show_spinner=False)
 def load_and_group_data():
     df = conn.read(worksheet_id=MASTER_SHEET_GID)
-
     if df is None or df.empty:
         raise ValueError("Master sheet is empty or not accessible")
-
+    
     df = df.dropna(how="all")
-
     if "incorrect" not in df.columns:
-        raise KeyError(
-            f"'incorrect' column not found. Columns available: {df.columns.tolist()}"
-        )
+        raise KeyError(f"'incorrect' column not found. Columns available: {df.columns.tolist()}")
 
     unique_sentences = df["incorrect"].unique().tolist()
     return df, unique_sentences
-
 
 try:
     master_df, unique_list = load_and_group_data()
     st.success("Master sheet loaded successfully ✅")
 except Exception as e:
-    st.error("REAL ERROR BELOW ⬇️")
+    st.error("Error loading master sheet")
     st.exception(e)
     st.stop()
 
@@ -87,11 +82,12 @@ except Exception as e:
 
 def get_existing_rating(m_id, u_idx):
     try:
-        df_check = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
+        df_check = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id], ttl=0)
         if df_check is not None and not df_check.empty:
             if "unique_set_index" in df_check.columns:
+                # Ensure comparison between same types (strings)
                 match = df_check[
-                    (df_check["unique_set_index"] == u_idx)
+                    (df_check["unique_set_index"].astype(str) == str(u_idx))
                     & (df_check["user"] == st.session_state.username)
                 ]
                 if not match.empty:
@@ -100,77 +96,66 @@ def get_existing_rating(m_id, u_idx):
         pass
     return None
 
-
 def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fix):
-
     submission_uuid = str(uuid.uuid4())
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 1. Update Model Ratings
     for m_id, rating in ratings_dict.items():
-
         m_row_data = versions[versions["id"] == m_id].iloc[0]
 
-        new_entry = pd.DataFrame(
-            [{
-                "submission_id": submission_uuid,
-                "user": st.session_state.username,
-                "unique_set_index": u_idx,
-                "incorrect": current_incorrect,
-                "corrected": m_row_data["corrected"],
-                "rating": rating,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }]
-        )
+        # Use native Python types in the dict to avoid GSheet serialization errors
+        new_entry = pd.DataFrame([{
+            "submission_id": submission_uuid,
+            "user": str(st.session_state.username),
+            "unique_set_index": int(u_idx),
+            "incorrect": str(current_incorrect),
+            "corrected": str(m_row_data["corrected"]),
+            "rating": int(rating),
+            "timestamp": ts,
+        }])
 
         try:
-            existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
-            if existing_df is None:
-                existing_df = pd.DataFrame()
-
-            if not existing_df.empty and "unique_set_index" in existing_df.columns:
-                mask = (
-                    (existing_df["unique_set_index"] == u_idx)
-                    & (existing_df["user"] == st.session_state.username)
-                )
+            existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id], ttl=0)
+            if existing_df is not None and not existing_df.empty:
+                # Filter out the old entry for this specific user/index
+                mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
+                       (existing_df["user"] == st.session_state.username)
                 existing_df = existing_df[~mask]
+                updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
+            else:
+                updated_df = new_entry
+            
+            # Final sanitize: Convert all to object/native and fill NaNs
+            updated_df = updated_df.fillna("")
+            conn.update(worksheet_id=MODEL_SHEET_GIDS[m_id], data=updated_df)
+        except Exception as e:
+            st.error(f"Failed to update sheet for Model {m_id}: {e}")
 
-            updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
-
-        except:
-            updated_df = new_entry
-
-        conn.update(worksheet_id=MODEL_SHEET_GIDS[m_id], data=updated_df)
-
-    # Save manual correction
+    # 2. Save User Manual Correction
     if manual_fix.strip():
-
-        user_entry = pd.DataFrame(
-            [{
-                "submission_id": submission_uuid,
-                "user": st.session_state.username,
-                "unique_set_index": u_idx,
-                "incorrect": current_incorrect,
-                "user_corrected": manual_fix,
-            }]
-        )
+        user_entry = pd.DataFrame([{
+            "submission_id": submission_uuid,
+            "user": str(st.session_state.username),
+            "unique_set_index": int(u_idx),
+            "incorrect": str(current_incorrect),
+            "user_corrected": str(manual_fix),
+        }])
 
         try:
-            df_user = conn.read(worksheet_id=USER_CORRECTION_GID)
-            if df_user is None:
-                df_user = pd.DataFrame()
-
-            if not df_user.empty and "unique_set_index" in df_user.columns:
-                mask = (
-                    (df_user["unique_set_index"] == u_idx)
-                    & (df_user["user"] == st.session_state.username)
-                )
+            df_user = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
+            if df_user is not None and not df_user.empty:
+                mask = (df_user["unique_set_index"].astype(str) == str(u_idx)) & \
+                       (df_user["user"] == st.session_state.username)
                 df_user = df_user[~mask]
-
-            updated_user_df = pd.concat([df_user, user_entry], ignore_index=True)
-
-        except:
-            updated_user_df = user_entry
-
-        conn.update(worksheet_id=USER_CORRECTION_GID, data=updated_user_df)
+                updated_user_df = pd.concat([df_user, user_entry], ignore_index=True)
+            else:
+                updated_user_df = user_entry
+            
+            updated_user_df = updated_user_df.fillna("")
+            conn.update(worksheet_id=USER_CORRECTION_GID, data=updated_user_df)
+        except Exception as e:
+            st.error(f"Failed to update manual correction sheet: {e}")
 
 # =========================================================
 # SESSION STATE
@@ -223,7 +208,9 @@ current_ratings = {}
 rating_options = list(range(1, 11))
 model_ids = sorted(MODEL_MAP.keys())
 
-for row_ids in [model_ids[:3], model_ids[3:]]:
+# Display models in 2 rows of 3 columns
+rows = [model_ids[:3], model_ids[3:]]
+for row_ids in rows:
     cols = st.columns(3)
     for i, m_id in enumerate(row_ids):
         with cols[i]:
@@ -237,9 +224,7 @@ for row_ids in [model_ids[:3], model_ids[3:]]:
                 current_ratings[m_id] = st.radio(
                     f"Rating for {m_id}",
                     options=rating_options,
-                    index=rating_options.index(existing_val)
-                    if existing_val in rating_options
-                    else None,
+                    index=rating_options.index(existing_val) if existing_val in rating_options else None,
                     horizontal=True,
                     key=f"rad_{m_id}_{st.session_state.u_index}",
                     label_visibility="collapsed",
@@ -263,7 +248,7 @@ if st.button(
     type="primary",
     disabled=not all_rated,
 ):
-    with st.spinner("Saving..."):
+    with st.spinner("Saving to Google Sheets..."):
         save_all_ratings(
             st.session_state.u_index,
             current_incorrect,
