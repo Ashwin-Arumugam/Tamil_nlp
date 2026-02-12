@@ -12,10 +12,10 @@ st.set_page_config(page_title="Model Comparison Tool", layout="wide")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# 🔥 MASTER SHEET GID (replace with your actual master gid)
+# MASTER SHEET GID
 MASTER_SHEET_GID = 1905633307
 
-# 🔥 MODEL TAB GIDs (these are correct already)
+# MODEL TAB GIDs
 MODEL_SHEET_GIDS = {
     "A": 364113859,
     "B": 952136825,
@@ -34,8 +34,8 @@ MODEL_MAP = {
     "F": "gemma"
 }
 
-# 🔥 USER CORRECTION TAB GID (replace with actual gid)
-USER_CORRECTION_GID = 677241304  # change this to actual gid of manual_gold_corrections
+# USER CORRECTION TAB GID
+USER_CORRECTION_GID = 677241304
 
 # =========================================================
 # USER AUTH
@@ -57,7 +57,7 @@ if "username" not in st.session_state:
 
 @st.cache_data(show_spinner=False)
 def load_and_group_data():
-    df = conn.read(worksheet=MASTER_SHEET_GID)
+    df = conn.read(worksheet_id=MASTER_SHEET_GID)
 
     if df is None or df.empty:
         raise ValueError("Master sheet is empty or not accessible")
@@ -73,7 +73,6 @@ def load_and_group_data():
     return df, unique_sentences
 
 
-
 try:
     master_df, unique_list = load_and_group_data()
     st.success("Master sheet loaded successfully ✅")
@@ -82,21 +81,21 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-
 # =========================================================
 # HELPER FUNCTIONS
 # =========================================================
 
 def get_existing_rating(m_id, u_idx):
     try:
-        df_check = conn.read(worksheet=MODEL_SHEET_GIDS[m_id])
-        if not df_check.empty and "unique_set_index" in df_check.columns:
-            match = df_check[
-                (df_check["unique_set_index"] == u_idx)
-                & (df_check["user"] == st.session_state.username)
-            ]
-            if not match.empty:
-                return int(match.iloc[0]["rating"])
+        df_check = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
+        if df_check is not None and not df_check.empty:
+            if "unique_set_index" in df_check.columns:
+                match = df_check[
+                    (df_check["unique_set_index"] == u_idx)
+                    & (df_check["user"] == st.session_state.username)
+                ]
+                if not match.empty:
+                    return int(match.iloc[0]["rating"])
     except:
         pass
     return None
@@ -111,21 +110,21 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         m_row_data = versions[versions["id"] == m_id].iloc[0]
 
         new_entry = pd.DataFrame(
-            [
-                {
-                    "submission_id": submission_uuid,
-                    "user": st.session_state.username,
-                    "unique_set_index": u_idx,
-                    "incorrect": current_incorrect,
-                    "corrected": m_row_data["corrected"],
-                    "rating": rating,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            ]
+            [{
+                "submission_id": submission_uuid,
+                "user": st.session_state.username,
+                "unique_set_index": u_idx,
+                "incorrect": current_incorrect,
+                "corrected": m_row_data["corrected"],
+                "rating": rating,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }]
         )
 
         try:
-            existing_df = conn.read(worksheet=MODEL_SHEET_GIDS[m_id])
+            existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
+            if existing_df is None:
+                existing_df = pd.DataFrame()
 
             if not existing_df.empty and "unique_set_index" in existing_df.columns:
                 mask = (
@@ -139,25 +138,25 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         except:
             updated_df = new_entry
 
-        conn.update(worksheet=MODEL_SHEET_GIDS[m_id], data=updated_df)
+        conn.update(worksheet_id=MODEL_SHEET_GIDS[m_id], data=updated_df)
 
     # Save manual correction
     if manual_fix.strip():
 
         user_entry = pd.DataFrame(
-            [
-                {
-                    "submission_id": submission_uuid,
-                    "user": st.session_state.username,
-                    "unique_set_index": u_idx,
-                    "incorrect": current_incorrect,
-                    "user_corrected": manual_fix,
-                }
-            ]
+            [{
+                "submission_id": submission_uuid,
+                "user": st.session_state.username,
+                "unique_set_index": u_idx,
+                "incorrect": current_incorrect,
+                "user_corrected": manual_fix,
+            }]
         )
 
         try:
-            df_user = conn.read(worksheet=USER_CORRECTION_GID)
+            df_user = conn.read(worksheet_id=USER_CORRECTION_GID)
+            if df_user is None:
+                df_user = pd.DataFrame()
 
             if not df_user.empty and "unique_set_index" in df_user.columns:
                 mask = (
@@ -171,8 +170,7 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         except:
             updated_user_df = user_entry
 
-        conn.update(worksheet=USER_CORRECTION_GID, data=updated_user_df)
-
+        conn.update(worksheet_id=USER_CORRECTION_GID, data=updated_user_df)
 
 # =========================================================
 # SESSION STATE
@@ -198,7 +196,6 @@ versions = master_df[master_df["incorrect"] == current_incorrect]
 
 st.title("Evaluation Workspace")
 
-# Navigation
 col_prev, col_mid, col_next = st.columns([1, 8, 1])
 
 with col_prev:
@@ -235,9 +232,7 @@ for row_ids in [model_ids[:3], model_ids[3:]]:
                 st.markdown(f"**{MODEL_MAP[m_id].capitalize()} output**")
                 st.info(m_row.iloc[0]["corrected"])
 
-                existing_val = get_existing_rating(
-                    m_id, st.session_state.u_index
-                )
+                existing_val = get_existing_rating(m_id, st.session_state.u_index)
 
                 current_ratings[m_id] = st.radio(
                     f"Rating for {m_id}",
@@ -277,50 +272,4 @@ if st.button(
             manual_fix,
         )
         st.session_state.u_index += 1
-        st.rerun()
-
-if not all_rated:
-    st.caption("Rate all models before proceeding.")
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-with st.sidebar:
-    st.header("Session Info")
-    st.write(f"Logged in: **{st.session_state.username}**")
-
-    st.divider()
-    st.header("Leaderboard")
-
-    try:
-        prog_df = conn.read(worksheet=MODEL_SHEET_GIDS["A"])
-        if not prog_df.empty:
-            stats = (
-                prog_df.groupby("user")["submission_id"]
-                .nunique()
-                .reset_index(name="Completed")
-            )
-            st.dataframe(
-                stats.sort_values("Completed", ascending=False),
-                hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.write("Awaiting submissions.")
-    except:
-        st.write("Leaderboard initializing.")
-
-    st.divider()
-    st.header("Navigation")
-
-    new_idx = st.number_input(
-        "Go to index:",
-        min_value=0,
-        max_value=len(unique_list) - 1,
-        value=st.session_state.u_index,
-    )
-
-    if st.button("Jump to Entry"):
-        st.session_state.u_index = new_idx
         st.rerun()
