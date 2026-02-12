@@ -12,16 +12,17 @@ st.set_page_config(page_title="Model Comparison Tool", layout="wide")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- SHEET NAMES (NOT GIDs) ---
-MASTER_SHEET = "Master"
+# MASTER SHEET GID
+MASTER_SHEET_GID = 1905633307
 
-MODEL_SHEETS = {
-    "A": "Model_A",
-    "B": "Model_B",
-    "C": "Model_C",
-    "D": "Model_D",
-    "E": "Model_E",
-    "F": "Model_F",
+# MODEL TAB GIDs
+MODEL_SHEET_GIDS = {
+    "A": 364113859,
+    "B": 952136825,
+    "C": 656105801,
+    "D": 1630302691,
+    "E": 803791042,
+    "F": 141437423,
 }
 
 MODEL_MAP = {
@@ -30,10 +31,11 @@ MODEL_MAP = {
     "C": "ministral",
     "D": "kimik2",
     "E": "gpt",
-    "F": "gemma",
+    "F": "gemma"
 }
 
-USER_CORRECTION_SHEET = "User_Corrections"
+# USER CORRECTION TAB GID
+USER_CORRECTION_GID = 677241304
 
 # =========================================================
 # USER AUTH
@@ -55,7 +57,7 @@ if "username" not in st.session_state:
 
 @st.cache_data(show_spinner=False)
 def load_and_group_data():
-    df = conn.read(worksheet=MASTER_SHEET)
+    df = conn.read(worksheet_id=MASTER_SHEET_GID)
 
     if df is None or df.empty:
         raise ValueError("Master sheet is empty or not accessible")
@@ -85,15 +87,16 @@ except Exception as e:
 
 def get_existing_rating(m_id, u_idx):
     try:
-        df_check = conn.read(worksheet=MODEL_SHEETS[m_id])
-        if not df_check.empty:
-            match = df_check[
-                (df_check["unique_set_index"] == u_idx)
-                & (df_check["user"] == st.session_state.username)
-            ]
-            if not match.empty:
-                return int(match.iloc[0]["rating"])
-    except Exception:
+        df_check = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
+        if df_check is not None and not df_check.empty:
+            if "unique_set_index" in df_check.columns:
+                match = df_check[
+                    (df_check["unique_set_index"] == u_idx)
+                    & (df_check["user"] == st.session_state.username)
+                ]
+                if not match.empty:
+                    return int(match.iloc[0]["rating"])
+    except:
         pass
     return None
 
@@ -119,23 +122,25 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         )
 
         try:
-            existing_df = conn.read(worksheet=MODEL_SHEETS[m_id])
-            if existing_df is None or existing_df.empty:
-                updated_df = new_entry
-            else:
+            existing_df = conn.read(worksheet_id=MODEL_SHEET_GIDS[m_id])
+            if existing_df is None:
+                existing_df = pd.DataFrame()
+
+            if not existing_df.empty and "unique_set_index" in existing_df.columns:
                 mask = (
                     (existing_df["unique_set_index"] == u_idx)
                     & (existing_df["user"] == st.session_state.username)
                 )
                 existing_df = existing_df[~mask]
-                updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
 
-        except Exception:
+            updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
+
+        except:
             updated_df = new_entry
 
-        conn.update(worksheet=MODEL_SHEETS[m_id], data=updated_df)
+        conn.update(worksheet_id=MODEL_SHEET_GIDS[m_id], data=updated_df)
 
-    # --- Manual correction ---
+    # Save manual correction
     if manual_fix.strip():
 
         user_entry = pd.DataFrame(
@@ -149,21 +154,23 @@ def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fi
         )
 
         try:
-            df_user = conn.read(worksheet=USER_CORRECTION_SHEET)
-            if df_user is None or df_user.empty:
-                updated_user_df = user_entry
-            else:
+            df_user = conn.read(worksheet_id=USER_CORRECTION_GID)
+            if df_user is None:
+                df_user = pd.DataFrame()
+
+            if not df_user.empty and "unique_set_index" in df_user.columns:
                 mask = (
                     (df_user["unique_set_index"] == u_idx)
                     & (df_user["user"] == st.session_state.username)
                 )
                 df_user = df_user[~mask]
-                updated_user_df = pd.concat([df_user, user_entry], ignore_index=True)
 
-        except Exception:
+            updated_user_df = pd.concat([df_user, user_entry], ignore_index=True)
+
+        except:
             updated_user_df = user_entry
 
-        conn.update(worksheet=USER_CORRECTION_SHEET, data=updated_user_df)
+        conn.update(worksheet_id=USER_CORRECTION_GID, data=updated_user_df)
 
 # =========================================================
 # SESSION STATE
@@ -181,7 +188,7 @@ if not unique_list:
     st.stop()
 
 if st.session_state.u_index >= len(unique_list):
-    st.success("All evaluations completed. Thank you 🙏")
+    st.success("All evaluations completed. Thank you.")
     st.stop()
 
 current_incorrect = unique_list[st.session_state.u_index]
