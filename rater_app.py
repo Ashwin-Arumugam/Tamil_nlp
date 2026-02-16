@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from streamlit_gsheets import GSheetsConnection
 from datetime import datetime
-import uuid
 import time
 
 # =========================================================
@@ -26,7 +25,7 @@ MODEL_SHEET_GIDS = {
     "F": 141437423,
 }
 
-# MODEL TAB NAMES (Used for Writing - MUST match your Sheet tab names exactly)
+# MODEL TAB NAMES (Writing targets)
 MODEL_TAB_NAMES = {
     "A": "qwen",
     "B": "nemotron",
@@ -36,7 +35,7 @@ MODEL_TAB_NAMES = {
     "F": "gemma"
 }
 
-# USER CORRECTION (Reading GID and Writing Name)
+# USER CORRECTION
 USER_CORRECTION_GID = 677241304
 USER_CORRECTION_TAB_NAME = "user_corrections"
 
@@ -46,10 +45,9 @@ USER_CORRECTION_TAB_NAME = "user_corrections"
 
 if "username" not in st.session_state:
     st.title("Welcome")
-    st.markdown("Please sign in to begin evaluation.")
     with st.form("login_gate"):
-        user_input = st.text_input("Full Name")
-        if st.form_submit_button("Sign In") and user_input:
+        user_input = st.text_input("Enter your unique ID / Name")
+        if st.form_submit_button("Start Labelling") and user_input:
             st.session_state.username = user_input.strip()
             st.rerun()
     st.stop()
@@ -58,41 +56,64 @@ if "username" not in st.session_state:
 # DATA LOADING
 # =========================================================
 
-@st.cache_data(show_spinner=False, ttl=300)
+@st.cache_data(show_spinner=False, ttl=600)
 def load_master_data():
+    # Read the master sheet
     df = conn.read(worksheet_id=MASTER_SHEET_GID)
     if df is None or df.empty:
-        raise ValueError("Master sheet is empty or not accessible")
+        raise ValueError("Master sheet is empty")
+    
+    # Clean and get unique sentences (based on incorrect column)
     df = df.dropna(how="all")
     unique_sentences = df["incorrect"].unique().tolist()
+    
     return df, unique_sentences
 
+# Load existing ratings into session state to allow "Memory"
 def load_all_existing_data():
     if "existing_data" not in st.session_state:
         st.session_state.existing_data = {}
         for m_id, gid in MODEL_SHEET_GIDS.items():
             try:
-                # Initial read to check for previous ratings
-                st.session_state.existing_data[m_id] = conn.read(worksheet_id=gid, ttl=60)
+                # We use ttl=0 here to ensure we get the absolute latest when app starts
+                df = conn.read(worksheet_id=gid, ttl=0)
+                st.session_state.existing_data[m_id] = df
             except:
                 st.session_state.existing_data[m_id] = pd.DataFrame()
 
 try:
     master_df, unique_list = load_master_data()
     load_all_existing_data()
-    st.success("Data synced successfully ✅")
 except Exception as e:
-    st.error("Error connecting to Google Sheets. Please wait a minute and refresh.")
+    st.error(f"Connection Error: {e}")
     st.stop()
 
 # =========================================================
-# HELPER FUNCTIONS
+# LOGIC FUNCTIONS
 # =========================================================
 
+def get_nemotron_row_id(master_df, current_incorrect):
+    """
+    Finds the row index of Model B (Nemotron) for the current sentence.
+    This creates the custom Submission ID part.
+    """
+    # Filter for the specific sentence and Model B
+    mask = (master_df["incorrect"] == current_incorrect) & (master_df["id"] == "B")
+    subset = master_df[mask]
+    
+    if not subset.empty:
+        # Return the actual DataFrame index (row number) + 2 (header offset)
+        return subset.index[0] + 2 
+    return "Unknown"
+
 def get_existing_rating(m_id, u_idx):
+    """Check session state for a previously saved rating"""
     df_check = st.session_state.existing_data.get(m_id)
+    
     if df_check is not None and not df_check.empty:
+        # Ensure columns exist before filtering
         if "unique_set_index" in df_check.columns and "user" in df_check.columns:
+            # Look for matching Index AND User
             match = df_check[
                 (df_check["unique_set_index"].astype(str) == str(u_idx))
                 & (df_check["user"] == st.session_state.username)
@@ -104,152 +125,157 @@ def get_existing_rating(m_id, u_idx):
                     return None
     return None
 
-def save_all_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fix):
-    submission_uuid = str(uuid.uuid4())
+def save_ratings(u_idx, current_incorrect, versions, ratings_dict, manual_fix):
+    
+    # 1. Generate the Custom Submission ID
+    # logic: NemotronRow_SentenceIndex
+    nem_row = get_nemotron_row_id(master_df, current_incorrect)
+    custom_sub_id = f"{nem_row}_{u_idx}"
+    
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1. Update Model Ratings
+    # 2. Iterate through each model and save ONLY specific columns
     for m_id, rating in ratings_dict.items():
-        m_row_data = versions[versions["id"] == m_id].iloc[0]
-
-        new_entry = pd.DataFrame([{
-            "submission_id": submission_uuid,
+        
+        # Define the EXACT columns you want to write
+        new_row_data = {
+            "submission_id": custom_sub_id,
             "user": str(st.session_state.username),
             "unique_set_index": int(u_idx),
-            "incorrect": str(current_incorrect),
-            "corrected": str(m_row_data["corrected"]),
             "rating": int(rating),
-            "timestamp": ts,
-        }])
+            "timestamp": ts
+        }
+        
+        new_entry = pd.DataFrame([new_row_data])
 
         try:
-            time.sleep(0.8) # Anti-throttle pause
-            gid = MODEL_SHEET_GIDS[m_id]
             tab_name = MODEL_TAB_NAMES[m_id]
             
-            # Read current state (using ID)
-            existing_df = conn.read(worksheet_id=gid, ttl=0)
+            # Get current data from session state (fastest) or fetch fresh
+            existing_df = st.session_state.existing_data.get(m_id)
             
             if existing_df is not None and not existing_df.empty:
-                if "unique_set_index" in existing_df.columns and "user" in existing_df.columns:
-                    mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
-                           (existing_df["user"] == st.session_state.username)
+                # Check if this user already rated this sentence
+                # We create a mask to find the specific row
+                mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
+                       (existing_df["user"] == st.session_state.username)
+                
+                if mask.any():
+                    # UPDATE EXISTING ROW: Drop the old one, append the new one
+                    # This prevents "output at the end" duplication
                     existing_df = existing_df[~mask]
-                updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
+                    updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
+                else:
+                    # APPEND NEW ROW
+                    updated_df = pd.concat([existing_df, new_entry], ignore_index=True)
             else:
                 updated_df = new_entry
             
-            # Write update (using Name)
-            conn.update(worksheet=tab_name, data=updated_df.fillna(""))
+            # Write to Google Sheets
+            conn.update(worksheet=tab_name, data=updated_df)
+            
+            # CRITICAL: Update Session State immediately so UI reflects the save
             st.session_state.existing_data[m_id] = updated_df
 
         except Exception as e:
-            st.error(f"Failed to update sheet for Model {m_id}: {str(e)}")
+            st.error(f"Failed to save Model {m_id}: {e}")
 
-    # 2. Save User Manual Correction
-    if manual_fix.strip():
-        user_entry = pd.DataFrame([{
-            "submission_id": submission_uuid,
-            "user": str(st.session_state.username),
-            "unique_set_index": int(u_idx),
-            "incorrect": str(current_incorrect),
-            "user_corrected": str(manual_fix),
-        }])
-
+    # 3. Handle Manual Corrections (Optional)
+    if manual_fix:
+        # User corrections might need different columns, adjust as needed
+        user_row_data = {
+             "submission_id": custom_sub_id,
+             "user": str(st.session_state.username),
+             "unique_set_index": int(u_idx),
+             "user_corrected": manual_fix,
+             "timestamp": ts
+        }
+        user_entry = pd.DataFrame([user_row_data])
+        
+        # Similar Update logic for corrections sheet
         try:
-            time.sleep(0.8)
-            df_user = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
+             # Fetch fresh just to be safe for corrections
+            df_user = conn.read(worksheet=USER_CORRECTION_TAB_NAME, ttl=0)
+            
             if df_user is not None and not df_user.empty:
-                if "unique_set_index" in df_user.columns and "user" in df_user.columns:
-                    mask = (df_user["unique_set_index"].astype(str) == str(u_idx)) & \
-                           (df_user["user"] == st.session_state.username)
-                    df_user = df_user[~mask]
+                mask = (df_user["unique_set_index"].astype(str) == str(u_idx)) & \
+                       (df_user["user"] == st.session_state.username)
+                df_user = df_user[~mask]
                 updated_user_df = pd.concat([df_user, user_entry], ignore_index=True)
             else:
                 updated_user_df = user_entry
+                
+            conn.update(worksheet=USER_CORRECTION_TAB_NAME, data=updated_user_df)
             
-            conn.update(worksheet=USER_CORRECTION_TAB_NAME, data=updated_user_df.fillna(""))
         except Exception as e:
-            st.error(f"Failed to update manual correction sheet: {str(e)}")
+            st.error(f"Failed to save correction: {e}")
 
 # =========================================================
-# MAIN UI
+# UI LAYOUT
 # =========================================================
 
 if "u_index" not in st.session_state:
     st.session_state.u_index = 0
 
-if not unique_list:
-    st.info("No data loaded.")
-    st.stop()
-
-if st.session_state.u_index >= len(unique_list):
-    st.success("All evaluations completed. Thank you.")
-    if st.button("Start Over"):
-        st.session_state.u_index = 0
-        st.rerun()
-    st.stop()
-
 current_incorrect = unique_list[st.session_state.u_index]
 versions = master_df[master_df["incorrect"] == current_incorrect]
 
 st.title("Evaluation Workspace")
+st.progress((st.session_state.u_index + 1) / len(unique_list))
 
-col_prev, col_mid, col_next = st.columns([1, 8, 1])
+# Navigation
+c1, c2, c3 = st.columns([1, 6, 1])
+if c1.button("⬅️ Previous") and st.session_state.u_index > 0:
+    st.session_state.u_index -= 1
+    st.rerun()
 
-with col_prev:
-    if st.button("Previous") and st.session_state.u_index > 0:
-        st.session_state.u_index -= 1
-        st.rerun()
+c2.markdown(f"<h4 style='text-align: center'>Sentence {st.session_state.u_index + 1}</h4>", unsafe_allow_html=True)
 
-with col_mid:
-    st.write(f"<center>Entry <b>{st.session_state.u_index + 1}</b> of {len(unique_list)}</center>", unsafe_allow_html=True)
-    st.progress((st.session_state.u_index + 1) / len(unique_list))
+if c3.button("Next ➡️") and st.session_state.u_index < len(unique_list) - 1:
+    st.session_state.u_index += 1
+    st.rerun()
 
-with col_next:
-    if st.button("Next") and st.session_state.u_index < len(unique_list) - 1:
-        st.session_state.u_index += 1
-        st.rerun()
+st.info(f"**Original:** {current_incorrect}")
 
-st.subheader("Original Text")
-st.markdown(f"> {current_incorrect}")
-st.divider()
+# Rating Form
+with st.form(key=f"rating_form_{st.session_state.u_index}"):
+    current_ratings = {}
+    model_ids = sorted(MODEL_TAB_NAMES.keys())
+    
+    # Display logic (Grid of models)
+    rows = [model_ids[:3], model_ids[3:]]
+    for row_ids in rows:
+        cols = st.columns(3)
+        for i, m_id in enumerate(row_ids):
+            with cols[i]:
+                m_row = versions[versions["id"] == m_id]
+                if not m_row.empty:
+                    st.markdown(f"**Model {m_id} ({MODEL_TAB_NAMES[m_id]})**")
+                    st.success(m_row.iloc[0]["corrected"])
+                    
+                    # Pre-fill if exists
+                    existing_val = get_existing_rating(m_id, st.session_state.u_index)
+                    
+                    current_ratings[m_id] = st.slider(
+                        f"Rate {m_id}", 1, 10, 
+                        value=existing_val if existing_val else 5,
+                        key=f"slider_{m_id}_{st.session_state.u_index}"
+                    )
 
-current_ratings = {}
-rating_options = list(range(1, 11))
-model_ids = sorted(MODEL_TAB_NAMES.keys())
+    st.divider()
+    manual_fix = st.text_area("Suggested Correction (Optional):")
+    
+    # Submit Button
+    submit = st.form_submit_button("Save Ratings", type="primary", use_container_width=True)
 
-# Display models in 2 rows
-rows = [model_ids[:3], model_ids[3:]]
-for row_ids in rows:
-    cols = st.columns(3)
-    for i, m_id in enumerate(row_ids):
-        with cols[i]:
-            m_row = versions[versions["id"] == m_id]
-            if not m_row.empty:
-                st.markdown(f"**{MODEL_TAB_NAMES[m_id].capitalize()} output**")
-                st.info(m_row.iloc[0]["corrected"])
-
-                existing_val = get_existing_rating(m_id, st.session_state.u_index)
-                default_idx = rating_options.index(existing_val) if existing_val in rating_options else None
-
-                current_ratings[m_id] = st.radio(
-                    f"Rating for {m_id}",
-                    options=rating_options,
-                    index=default_idx,
-                    horizontal=True,
-                    key=f"rad_{m_id}_{st.session_state.u_index}",
-                    label_visibility="collapsed",
-                )
-
-st.divider()
-st.subheader("Reference Correction")
-manual_fix = st.text_area("Provide ideal correction:", key=f"manual_{st.session_state.u_index}")
-
-all_rated = all(current_ratings.get(m) is not None for m in model_ids)
-
-if st.button("Save and Continue", use_container_width=True, type="primary", disabled=not all_rated):
-    with st.spinner("Saving results..."):
-        save_all_ratings(st.session_state.u_index, current_incorrect, versions, current_ratings, manual_fix)
+if submit:
+    with st.spinner("Saving to Google Sheets..."):
+        save_ratings(st.session_state.u_index, current_incorrect, versions, current_ratings, manual_fix)
+    
+    st.success("Saved!")
+    time.sleep(0.5) # Brief pause to show success
+    
+    # Auto-advance
+    if st.session_state.u_index < len(unique_list) - 1:
         st.session_state.u_index += 1
         st.rerun()
