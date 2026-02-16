@@ -11,8 +11,9 @@ st.set_page_config(page_title="Model Eval Tool", layout="wide")
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 MASTER_SHEET_GID = 1905633307
+USER_CORRECTION_GID = 677241304
 
-# Maps Model IDs to Sheet GIDs (Ensure these are unique!)
+# Maps Model IDs to Sheet GIDs
 MODEL_SHEET_GIDS = {
     "A": 364113859,
     "B": 952136825,
@@ -22,7 +23,7 @@ MODEL_SHEET_GIDS = {
     "F": 141437423,
 }
 
-# Maps Model IDs to Tab Names (Must match GSheet exactly)
+# Maps Model IDs to Tab Names
 MODEL_TAB_NAMES = {
     "A": "qwen",
     "B": "nemotron",
@@ -32,11 +33,8 @@ MODEL_TAB_NAMES = {
     "F": "gemma"
 }
 
-USER_CORRECTION_GID = 677241304
-USER_CORRECTION_TAB_NAME = "user_corrections"
-
 # =========================================================
-# 2. DATA LOADING & TYPE CLEANING
+# 2. STATE MANAGEMENT (The "Separate Variables" Logic)
 # =========================================================
 
 if "username" not in st.session_state:
@@ -45,11 +43,16 @@ if "username" not in st.session_state:
         user = st.text_input("Username")
         if st.form_submit_button("Start") and user:
             st.session_state.username = user.strip()
+            # Force reload of all data on login
             st.cache_data.clear()
-            if "existing_data" in st.session_state:
-                del st.session_state.existing_data
+            if "local_dfs" in st.session_state:
+                del st.session_state.local_dfs
             st.rerun()
     st.stop()
+
+# Initialize the Dictionary to hold separate DataFrames
+if "local_dfs" not in st.session_state:
+    st.session_state.local_dfs = {}
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_master_data():
@@ -61,42 +64,48 @@ def load_master_data():
     unique_sentences = df["incorrect"].unique().tolist()
     return df, unique_sentences
 
-def clean_data_types(df):
-    """Ensures robust types for matching."""
+def clean_df(df):
+    """Ensures consistent types for the local variables."""
     if df is None or df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["submission_id", "user", "rating"])
+    
     if "submission_id" in df.columns:
         df["submission_id"] = df["submission_id"].astype(str)
     if "rating" in df.columns:
         df["rating"] = pd.to_numeric(df["rating"], errors='coerce').fillna(0).astype(int)
     return df
 
-def sync_existing_ratings():
-    """Populates history for the UI."""
-    if "existing_data" not in st.session_state:
-        st.session_state.existing_data = {}
-    
-    # Load Model Sheets
+def load_all_tabs_into_variables():
+    """
+    Loads EVERY tab into its own key in st.session_state.local_dfs
+    This happens once (or on refresh) to populate the 'variables'.
+    """
+    # 1. Load Model Tabs
     for m_id, gid in MODEL_SHEET_GIDS.items():
         try:
+            # Read from Cloud
             df = conn.read(worksheet_id=gid, ttl=0)
-            st.session_state.existing_data[m_id] = clean_data_types(df)
-        except:
-            st.session_state.existing_data[m_id] = pd.DataFrame()
-            
-    # Load Corrections
-    try:
-        df_user = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
-        if not df_user.empty and "submission_id" in df_user.columns:
-            df_user["submission_id"] = df_user["submission_id"].astype(str)
-        st.session_state.existing_data["corrections"] = df_user
-    except:
-        st.session_state.existing_data["corrections"] = pd.DataFrame()
+            # Store in Variable
+            st.session_state.local_dfs[m_id] = clean_df(df)
+        except Exception:
+            st.session_state.local_dfs[m_id] = pd.DataFrame(columns=["submission_id", "user", "rating"])
 
-with st.spinner("Syncing history..."):
-    master_df, unique_list = load_master_data()
-    if "existing_data" not in st.session_state or not st.session_state.existing_data:
-        sync_existing_ratings()
+    # 2. Load Corrections Tab
+    try:
+        df_corr = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
+        if "submission_id" in df_corr.columns:
+            df_corr["submission_id"] = df_corr["submission_id"].astype(str)
+        st.session_state.local_dfs["corrections"] = df_corr
+    except:
+        st.session_state.local_dfs["corrections"] = pd.DataFrame(columns=["submission_id", "user", "user_corrected"])
+
+# Trigger Load if empty
+if not st.session_state.local_dfs:
+    with st.spinner("Initializing variables from cloud..."):
+        load_master_data()
+        load_all_tabs_into_variables()
+
+master_df, unique_list = load_master_data()
 
 # =========================================================
 # 3. HELPER FUNCTIONS
@@ -109,76 +118,45 @@ def get_nemotron_row_id(master_df, current_incorrect):
         return str(subset.index[0] + 2)
     return "Unknown"
 
-def get_saved_rating(m_id, sub_id):
-    df = st.session_state.existing_data.get(m_id)
+def get_existing_rating(m_id, sub_id):
+    """Reads from the LOCAL variable, not the cloud."""
+    df = st.session_state.local_dfs.get(m_id)
     if df is not None and not df.empty:
-        if "submission_id" in df.columns and "user" in df.columns:
-            mask = (df["submission_id"] == str(sub_id)) & \
-                   (df["user"] == st.session_state.username)
-            match = df[mask]
-            if not match.empty:
-                try:
-                    val = int(match.iloc[0]["rating"])
-                    return val if val > 0 else None
-                except:
-                    return None
+        mask = (df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)
+        match = df[mask]
+        if not match.empty:
+            try:
+                val = int(match.iloc[0]["rating"])
+                return val if val > 0 else None
+            except:
+                return None
     return None
 
-def strict_save_to_sheet(sheet_key, tab_name, new_entry_df, sub_id, gid):
+def update_local_variable(key, new_entry_df, sub_id):
     """
-    STRICT SAVE: 
-    1. Reads fresh. 
-    2. Keeps ONLY allowed columns. 
-    3. Updates.
+    Updates the specific dataframe in the local_dfs dictionary.
+    Removes old entry for this user/id, appends new one.
     """
-    try:
-        # 1. READ FRESH
-        try:
-            current_sheet_df = conn.read(worksheet_id=gid, ttl=0)
-        except Exception:
-            # If read fails, assume empty but warn
-            current_sheet_df = pd.DataFrame()
+    current_df = st.session_state.local_dfs.get(key)
+    
+    # Filter out OLD entry for this specific sentence & user
+    if current_df is not None and not current_df.empty:
+        if "submission_id" in current_df.columns and "user" in current_df.columns:
+            mask = (current_df["submission_id"] == str(sub_id)) & \
+                   (current_df["user"] == st.session_state.username)
+            current_df = current_df[~mask]
+    else:
+        # If empty, initialize
+        current_df = pd.DataFrame()
 
-        # 2. CLEAN TYPES
-        current_sheet_df = clean_data_types(current_sheet_df)
-
-        # 3. DEFINE STRICT ALLOWED COLUMNS
-        # Determine if this is a rating sheet or correction sheet
-        if "user_corrected" in new_entry_df.columns:
-            allowed_cols = ["submission_id", "user", "user_corrected"]
-        else:
-            allowed_cols = ["submission_id", "user", "rating"]
-
-        # 4. FILTER OLD DATA (Remove existing columns not in allowed list)
-        if not current_sheet_df.empty:
-            # Keep only columns that exist in our schema
-            valid_cols = [c for c in current_sheet_df.columns if c in allowed_cols]
-            current_sheet_df = current_sheet_df[valid_cols]
-
-            # Remove OLD entry for this user
-            if "submission_id" in current_sheet_df.columns and "user" in current_sheet_df.columns:
-                mask = (current_sheet_df["submission_id"] == str(sub_id)) & \
-                       (current_sheet_df["user"] == st.session_state.username)
-                current_sheet_df = current_sheet_df[~mask]
-        
-        # 5. MERGE (New on Top)
-        # Ensure new_entry_df only has allowed columns too
-        new_entry_df = new_entry_df[allowed_cols] 
-        updated_df = pd.concat([new_entry_df, current_sheet_df], ignore_index=True)
-
-        # 6. WRITE
-        conn.update(worksheet=tab_name, data=updated_df)
-        
-        # 7. UPDATE STATE
-        st.session_state.existing_data[sheet_key] = updated_df
-        return True
-        
-    except Exception as e:
-        st.error(f"Error saving to {tab_name}: {e}")
-        return False
+    # Append NEW entry to top
+    updated_df = pd.concat([new_entry_df, current_df], ignore_index=True)
+    
+    # Save back to State Variable
+    st.session_state.local_dfs[key] = updated_df
 
 # =========================================================
-# 4. UI LAYOUT
+# 4. UI
 # =========================================================
 
 if "u_index" not in st.session_state:
@@ -195,10 +173,6 @@ current_incorrect = unique_list[st.session_state.u_index]
 versions = master_df[master_df["incorrect"] == current_incorrect]
 nem_row_id = get_nemotron_row_id(master_df, current_incorrect)
 
-# --- Header ---
-st.markdown(f"### User: {st.session_state.username}")
-st.progress((st.session_state.u_index + 1) / len(unique_list))
-
 # --- Navigation ---
 c1, c2, c3 = st.columns([1, 6, 1])
 if c1.button("⬅️ Prev") and st.session_state.u_index > 0:
@@ -212,7 +186,7 @@ if c3.button("Next ➡️") and st.session_state.u_index < len(unique_list) - 1:
 st.info(f"**Original:** {current_incorrect}")
 st.divider()
 
-# --- Ratings Grid ---
+# --- Ratings ---
 model_ids = sorted(MODEL_TAB_NAMES.keys())
 rating_options = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
@@ -226,81 +200,75 @@ for row_ids in rows:
                 st.markdown(f"**{MODEL_TAB_NAMES[m_id].capitalize()}**")
                 st.success(m_row.iloc[0]["corrected"])
                 
+                # Check Local Variable for previous rating
                 key = f"pills_{m_id}_{st.session_state.u_index}"
-                
-                # Pre-fill
                 if key not in st.session_state:
-                    saved_val = get_saved_rating(m_id, nem_row_id)
+                    saved_val = get_existing_rating(m_id, nem_row_id)
                     if saved_val:
                         st.session_state[key] = saved_val
-
+                
                 st.pills("Rate", rating_options, key=key, label_visibility="collapsed")
 
 st.divider()
+manual_fix = st.text_area("Correction (Optional):", key=f"fix_{st.session_state.u_index}")
 
-# --- Manual Correction ---
-correction_key = f"fix_{st.session_state.u_index}"
-manual_fix = st.text_area("Correction (Optional):", key=correction_key)
-
-# --- Save Button ---
+# --- SAVE LOGIC ---
 if st.button("Save Ratings", type="primary", use_container_width=True):
-    # Create a progress bar for saving because it might take a few seconds now
-    save_bar = st.progress(0, text="Starting save...")
+    save_bar = st.progress(0, text="Updating variables...")
     
-    total_ops = len(model_ids) + (1 if manual_fix else 0)
-    current_op = 0
-    
-    # 1. SAVE RATINGS LOOP
+    # 1. Update LOCAL Variables first
+    # -----------------------------
     for m_id in model_ids:
         val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
-        
         if val is not None:
-            save_bar.progress((current_op / total_ops), text=f"Saving {MODEL_TAB_NAMES[m_id]}...")
-            
-            # Construct DataFrame STRICTLY for this model
-            new_entry = pd.DataFrame([{
+            # Create Row
+            new_row = pd.DataFrame([{
                 "submission_id": str(nem_row_id),
                 "user": str(st.session_state.username),
                 "rating": int(val)
             }])
+            # Append to variable
+            update_local_variable(m_id, new_row, nem_row_id)
             
-            strict_save_to_sheet(
-                m_id, 
-                MODEL_TAB_NAMES[m_id], 
-                new_entry, 
-                nem_row_id, 
-                MODEL_SHEET_GIDS[m_id]
-            )
-            
-            # CRITICAL: Pause to let GSheets API breathe
-            time.sleep(1.0)
-            
-            # Memory Cleanup
-            del new_entry
-            
-        current_op += 1
-    
-    # 2. SAVE MANUAL FIX
     if manual_fix:
-        save_bar.progress(0.9, text="Saving corrections...")
-        user_entry = pd.DataFrame([{
+        user_row = pd.DataFrame([{
             "submission_id": str(nem_row_id),
             "user": str(st.session_state.username),
             "user_corrected": str(manual_fix)
         }])
-        strict_save_to_sheet(
-            "corrections", 
-            USER_CORRECTION_TAB_NAME, 
-            user_entry, 
-            nem_row_id, 
-            USER_CORRECTION_GID
-        )
-        time.sleep(0.5)
+        update_local_variable("corrections", user_row, nem_row_id)
+
+    # 2. Write Variables to Cloud
+    # ---------------------------
+    total_tabs = len(model_ids) + 1
+    current_tab = 0
+    
+    # Loop through keys in our local variable dictionary
+    for key, df in st.session_state.local_dfs.items():
+        if not df.empty:
+            # Determine Tab Name
+            if key in MODEL_TAB_NAMES:
+                tab_name = MODEL_TAB_NAMES[key]
+            elif key == "corrections":
+                tab_name = "user_corrections"
+            else:
+                continue # Skip unknown keys
+            
+            save_bar.progress((current_tab / total_tabs), text=f"Writing {tab_name}...")
+            
+            try:
+                conn.update(worksheet=tab_name, data=df)
+                time.sleep(1.0) # Pause to prevent API mixing
+            except Exception as e:
+                st.error(f"Failed to write {tab_name}: {e}")
+            
+            current_tab += 1
 
     save_bar.progress(1.0, text="Done!")
-    st.success("Saved successfully!")
+    st.success("Saved!")
     time.sleep(0.5)
     
+    # Advance
     if st.session_state.u_index < len(unique_list) - 1:
         st.session_state.u_index += 1
         st.rerun()
