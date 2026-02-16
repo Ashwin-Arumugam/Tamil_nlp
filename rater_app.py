@@ -68,8 +68,6 @@ def load_existing_ratings():
         for m_id, gid in MODEL_SHEET_GIDS.items():
             try:
                 df = conn.read(worksheet_id=gid, ttl=0)
-                # If the read dataframe has extra columns from a previous bad save, 
-                # we don't worry about them here, but we will strip them before saving back.
                 st.session_state.existing_data[m_id] = df
             except:
                 st.session_state.existing_data[m_id] = pd.DataFrame()
@@ -91,8 +89,7 @@ with st.spinner("Loading data..."):
 
 def get_nemotron_row_id(master_df, current_incorrect):
     """
-    Finds the row number of the 'Nemotron' (id=B) version of this sentence.
-    This serves as the unique 'submission_id' for the whole set.
+    Finds the row number of the 'Nemotron' (id=B) version.
     """
     mask = (master_df["incorrect"] == current_incorrect) & (master_df["id"] == "B")
     subset = master_df[mask]
@@ -117,35 +114,35 @@ def get_saved_rating(m_id, u_idx):
 
 def save_entry_to_sheet(sheet_key, tab_name, new_entry_df, u_idx):
     """
-    Upserts data while STRICTLY enforcing column schema.
+    Upserts data: Removes old entry for this user/sentence,
+    then adds the NEW entry to the TOP of the dataframe.
     """
     try:
         existing_df = st.session_state.existing_data.get(sheet_key)
         
-        # 1. CLEAN EXISTING DATA (Safety Step)
-        # If existing data somehow got polluted with 'incorrect' columns, ignore them
+        # Define allowed columns (Strict Schema)
         allowed_cols = ["submission_id", "user", "unique_set_index", "rating", "timestamp", "user_corrected"]
         
         if existing_df is not None and not existing_df.empty:
-            # Filter existing DF to only keep relevant columns if they exist
+            # Filter existing DF to only keep relevant columns
             valid_existing_cols = [c for c in existing_df.columns if c in allowed_cols]
             existing_df = existing_df[valid_existing_cols]
 
-            # Remove old entry for this user/sentence
+            # Remove OLD entry for this user/sentence (De-duplication)
             if "unique_set_index" in existing_df.columns and "user" in existing_df.columns:
                 mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
                        (existing_df["user"] == st.session_state.username)
                 existing_df = existing_df[~mask]
             
-            # Combine
-            updated_df = pd.concat([existing_df, new_entry_df], ignore_index=True)
+            # Combine: NEW Entry FIRST, then Existing Data
+            updated_df = pd.concat([new_entry_df, existing_df], ignore_index=True)
         else:
             updated_df = new_entry_df
 
-        # 2. WRITE TO SHEET
+        # Write to Google Sheets
         conn.update(worksheet=tab_name, data=updated_df)
         
-        # 3. UPDATE SESSION STATE
+        # Update Session State
         st.session_state.existing_data[sheet_key] = updated_df
         return True
         
@@ -221,7 +218,6 @@ if st.button("Save Ratings", type="primary", use_container_width=True):
             val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
             if val is not None:
                 # STRICT DATAFRAME CREATION
-                # We define ONLY the columns we want. No 'incorrect' or 'corrected' text here.
                 clean_entry = pd.DataFrame([{
                     "submission_id": int(nem_row_id) if nem_row_id != "Unknown" else 0,
                     "user": str(st.session_state.username),
