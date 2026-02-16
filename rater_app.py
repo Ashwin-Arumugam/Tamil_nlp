@@ -33,8 +33,12 @@ MODEL_TAB_NAMES = {
     "F": "gemma"
 }
 
+# STRICT SCHEMAS
+RATING_COLS = ["submission_id", "user", "rating"]
+CORRECTION_COLS = ["submission_id", "user", "user_corrected"]
+
 # =========================================================
-# 2. STATE MANAGEMENT (The "Separate Variables" Logic)
+# 2. STATE MANAGEMENT & LOADING
 # =========================================================
 
 if "username" not in st.session_state:
@@ -43,14 +47,14 @@ if "username" not in st.session_state:
         user = st.text_input("Username")
         if st.form_submit_button("Start") and user:
             st.session_state.username = user.strip()
-            # Force reload of all data on login
             st.cache_data.clear()
+            # Clear local variables to force reload
             if "local_dfs" in st.session_state:
                 del st.session_state.local_dfs
             st.rerun()
     st.stop()
 
-# Initialize the Dictionary to hold separate DataFrames
+# Initialize Container for Tab Variables
 if "local_dfs" not in st.session_state:
     st.session_state.local_dfs = {}
 
@@ -64,42 +68,57 @@ def load_master_data():
     unique_sentences = df["incorrect"].unique().tolist()
     return df, unique_sentences
 
-def clean_df(df):
-    """Ensures consistent types for the local variables."""
+def clean_rating_df(df):
+    """Ensures types are safe for appending."""
     if df is None or df.empty:
-        return pd.DataFrame(columns=["submission_id", "user", "rating"])
+        return pd.DataFrame(columns=RATING_COLS)
     
-    if "submission_id" in df.columns:
-        df["submission_id"] = df["submission_id"].astype(str)
-    if "rating" in df.columns:
-        df["rating"] = pd.to_numeric(df["rating"], errors='coerce').fillna(0).astype(int)
-    return df
+    # Ensure columns exist
+    for col in RATING_COLS:
+        if col not in df.columns:
+            df[col] = None
+            
+    # Clean Types
+    df["submission_id"] = df["submission_id"].astype(str)
+    df["rating"] = pd.to_numeric(df["rating"], errors='coerce').fillna(0).astype(int)
+    
+    # Filter to strict columns
+    return df[RATING_COLS]
 
 def load_all_tabs_into_variables():
     """
-    Loads EVERY tab into its own key in st.session_state.local_dfs
-    This happens once (or on refresh) to populate the 'variables'.
+    Loads all tabs into memory. 
+    If a tab is empty, initializes it with empty schema.
     """
-    # 1. Load Model Tabs
+    # 1. Load Model Rating Tabs
     for m_id, gid in MODEL_SHEET_GIDS.items():
         try:
-            # Read from Cloud
             df = conn.read(worksheet_id=gid, ttl=0)
-            # Store in Variable
-            st.session_state.local_dfs[m_id] = clean_df(df)
+            if df is None or df.empty:
+                # Initialize EMPTY with headers
+                st.session_state.local_dfs[m_id] = pd.DataFrame(columns=RATING_COLS)
+            else:
+                # Clean and Store
+                st.session_state.local_dfs[m_id] = clean_rating_df(df)
         except Exception:
-            st.session_state.local_dfs[m_id] = pd.DataFrame(columns=["submission_id", "user", "rating"])
+            # Fallback for errors
+            st.session_state.local_dfs[m_id] = pd.DataFrame(columns=RATING_COLS)
 
-    # 2. Load Corrections Tab
+    # 2. Load User Corrections Tab
     try:
-        df_corr = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
-        if "submission_id" in df_corr.columns:
-            df_corr["submission_id"] = df_corr["submission_id"].astype(str)
-        st.session_state.local_dfs["corrections"] = df_corr
+        df = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
+        if df is None or df.empty:
+            st.session_state.local_dfs["corrections"] = pd.DataFrame(columns=CORRECTION_COLS)
+        else:
+            if "submission_id" in df.columns:
+                df["submission_id"] = df["submission_id"].astype(str)
+            # Ensure strictly correction columns
+            valid_cols = [c for c in CORRECTION_COLS if c in df.columns]
+            st.session_state.local_dfs["corrections"] = df[valid_cols]
     except:
-        st.session_state.local_dfs["corrections"] = pd.DataFrame(columns=["submission_id", "user", "user_corrected"])
+        st.session_state.local_dfs["corrections"] = pd.DataFrame(columns=CORRECTION_COLS)
 
-# Trigger Load if empty
+# Trigger Load on First Run
 if not st.session_state.local_dfs:
     with st.spinner("Initializing variables from cloud..."):
         load_master_data()
@@ -119,7 +138,7 @@ def get_nemotron_row_id(master_df, current_incorrect):
     return "Unknown"
 
 def get_existing_rating(m_id, sub_id):
-    """Reads from the LOCAL variable, not the cloud."""
+    """Checks the LOCAL variable for existing rating."""
     df = st.session_state.local_dfs.get(m_id)
     if df is not None and not df.empty:
         mask = (df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)
@@ -132,27 +151,30 @@ def get_existing_rating(m_id, sub_id):
                 return None
     return None
 
-def update_local_variable(key, new_entry_df, sub_id):
+def update_local_variable(key, new_row_df, sub_id):
     """
-    Updates the specific dataframe in the local_dfs dictionary.
-    Removes old entry for this user/id, appends new one.
+    Updates the in-memory dataframe.
+    1. Removes old entry for this user+id.
+    2. Appends new entry.
     """
     current_df = st.session_state.local_dfs.get(key)
     
-    # Filter out OLD entry for this specific sentence & user
+    # 1. Remove Old Entry (De-dupe)
     if current_df is not None and not current_df.empty:
-        if "submission_id" in current_df.columns and "user" in current_df.columns:
-            mask = (current_df["submission_id"] == str(sub_id)) & \
-                   (current_df["user"] == st.session_state.username)
-            current_df = current_df[~mask]
+        mask = (current_df["submission_id"] == str(sub_id)) & \
+               (current_df["user"] == st.session_state.username)
+        current_df = current_df[~mask]
     else:
-        # If empty, initialize
-        current_df = pd.DataFrame()
+        # If was empty, just start fresh
+        if key == "corrections":
+            current_df = pd.DataFrame(columns=CORRECTION_COLS)
+        else:
+            current_df = pd.DataFrame(columns=RATING_COLS)
 
-    # Append NEW entry to top
-    updated_df = pd.concat([new_entry_df, current_df], ignore_index=True)
+    # 2. Append New (Top)
+    updated_df = pd.concat([new_row_df, current_df], ignore_index=True)
     
-    # Save back to State Variable
+    # 3. Save to Memory
     st.session_state.local_dfs[key] = updated_df
 
 # =========================================================
@@ -200,8 +222,9 @@ for row_ids in rows:
                 st.markdown(f"**{MODEL_TAB_NAMES[m_id].capitalize()}**")
                 st.success(m_row.iloc[0]["corrected"])
                 
-                # Check Local Variable for previous rating
+                # Check Local Memory
                 key = f"pills_{m_id}_{st.session_state.u_index}"
+                # If widget state not set, try to fetch from loaded variable
                 if key not in st.session_state:
                     saved_val = get_existing_rating(m_id, nem_row_id)
                     if saved_val:
@@ -214,20 +237,18 @@ manual_fix = st.text_area("Correction (Optional):", key=f"fix_{st.session_state.
 
 # --- SAVE LOGIC ---
 if st.button("Save Ratings", type="primary", use_container_width=True):
-    save_bar = st.progress(0, text="Updating variables...")
+    save_bar = st.progress(0, text="Updating local variables...")
     
-    # 1. Update LOCAL Variables first
-    # -----------------------------
+    # 1. Update LOCAL Variables (Memory Only)
+    # ---------------------------------------
     for m_id in model_ids:
         val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
         if val is not None:
-            # Create Row
             new_row = pd.DataFrame([{
                 "submission_id": str(nem_row_id),
                 "user": str(st.session_state.username),
                 "rating": int(val)
             }])
-            # Append to variable
             update_local_variable(m_id, new_row, nem_row_id)
             
     if manual_fix:
@@ -238,27 +259,28 @@ if st.button("Save Ratings", type="primary", use_container_width=True):
         }])
         update_local_variable("corrections", user_row, nem_row_id)
 
-    # 2. Write Variables to Cloud
-    # ---------------------------
+    # 2. Write Variables to Cloud (Disk)
+    # ----------------------------------
     total_tabs = len(model_ids) + 1
     current_tab = 0
     
-    # Loop through keys in our local variable dictionary
     for key, df in st.session_state.local_dfs.items():
+        # Only write if we have data to write
         if not df.empty:
-            # Determine Tab Name
+            
+            # Map key to Tab Name
             if key in MODEL_TAB_NAMES:
                 tab_name = MODEL_TAB_NAMES[key]
             elif key == "corrections":
                 tab_name = "user_corrections"
             else:
-                continue # Skip unknown keys
+                continue 
             
             save_bar.progress((current_tab / total_tabs), text=f"Writing {tab_name}...")
             
             try:
                 conn.update(worksheet=tab_name, data=df)
-                time.sleep(1.0) # Pause to prevent API mixing
+                time.sleep(1.0) # Pause for API stability
             except Exception as e:
                 st.error(f"Failed to write {tab_name}: {e}")
             
@@ -268,7 +290,6 @@ if st.button("Save Ratings", type="primary", use_container_width=True):
     st.success("Saved!")
     time.sleep(0.5)
     
-    # Advance
     if st.session_state.u_index < len(unique_list) - 1:
         st.session_state.u_index += 1
         st.rerun()
