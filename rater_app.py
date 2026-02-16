@@ -5,20 +5,16 @@ from datetime import datetime
 import time
 
 # =========================================================
-# 1. CONFIGURATION & SETUP
+# 1. CONFIGURATION
 # =========================================================
 
 st.set_page_config(page_title="Model Eval Tool", layout="wide")
-
-# Connect to Google Sheets
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- CONSTANTS ---
-# 1. Master Data Sheet (Where we read sentences from)
+# --- SHEET CONFIGURATION ---
 MASTER_SHEET_GID = 1905633307
 
-# 2. Model Output Sheets (Where we read/write model data)
-# Keys (A-F) map to your specific Sheet GIDs
+# Maps Model IDs (A-F) to their specific Sheet GIDs
 MODEL_SHEET_GIDS = {
     "A": 364113859,
     "B": 952136825,
@@ -28,7 +24,7 @@ MODEL_SHEET_GIDS = {
     "F": 141437423,
 }
 
-# 3. Model Tab Names (Exact names of tabs in Google Sheets)
+# Maps Model IDs to Tab Names (for writing)
 MODEL_TAB_NAMES = {
     "A": "qwen",
     "B": "nemotron",
@@ -38,97 +34,77 @@ MODEL_TAB_NAMES = {
     "F": "gemma"
 }
 
-# 4. User Corrections Sheet
 USER_CORRECTION_GID = 677241304
 USER_CORRECTION_TAB_NAME = "user_corrections"
 
 # =========================================================
-# 2. USER AUTHENTICATION
+# 2. DATA LOADING
 # =========================================================
 
 if "username" not in st.session_state:
-    st.title("🛡️ Evaluation Login")
-    with st.form("login_gate"):
-        user_input = st.text_input("Enter your Name or ID:")
-        if st.form_submit_button("Start Evaluation") and user_input:
-            st.session_state.username = user_input.strip()
+    st.title("Login")
+    with st.form("login"):
+        user = st.text_input("Username")
+        if st.form_submit_button("Start") and user:
+            st.session_state.username = user.strip()
             st.rerun()
     st.stop()
 
-# =========================================================
-# 3. DATA LOADING FUNCTIONS
-# =========================================================
-
 @st.cache_data(show_spinner=False, ttl=600)
 def load_master_data():
-    """Loads the source sentences and model outputs."""
-    try:
-        df = conn.read(worksheet_id=MASTER_SHEET_GID)
-        if df is None or df.empty:
-            st.error("Master sheet is empty.")
-            st.stop()
-        
-        # Clean empty rows
-        df = df.dropna(how="all")
-        
-        # Get list of unique sentences to iterate through
-        unique_sentences = df["incorrect"].unique().tolist()
-        return df, unique_sentences
-    except Exception as e:
-        st.error(f"Failed to load Master Sheet: {e}")
+    # Read strictly what is needed
+    df = conn.read(worksheet_id=MASTER_SHEET_GID)
+    if df is None or df.empty:
+        st.error("Master sheet is empty.")
         st.stop()
+    df = df.dropna(how="all")
+    unique_sentences = df["incorrect"].unique().tolist()
+    return df, unique_sentences
 
 def load_existing_ratings():
-    """
-    Loads current ratings from all sheets into session state.
-    This allows us to 'remember' what you rated previously.
-    """
     if "existing_data" not in st.session_state:
         st.session_state.existing_data = {}
-        
         # Load Model Sheets
         for m_id, gid in MODEL_SHEET_GIDS.items():
             try:
-                # ttl=0 ensures we get the latest data on startup
                 df = conn.read(worksheet_id=gid, ttl=0)
+                # If the read dataframe has extra columns from a previous bad save, 
+                # we don't worry about them here, but we will strip them before saving back.
                 st.session_state.existing_data[m_id] = df
             except:
                 st.session_state.existing_data[m_id] = pd.DataFrame()
         
-        # Load User Corrections Sheet
+        # Load User Corrections
         try:
             df_user = conn.read(worksheet_id=USER_CORRECTION_GID, ttl=0)
             st.session_state.existing_data["corrections"] = df_user
         except:
             st.session_state.existing_data["corrections"] = pd.DataFrame()
 
-# Load Data on App Start
-with st.spinner("Syncing with Google Sheets..."):
+with st.spinner("Loading data..."):
     master_df, unique_list = load_master_data()
     load_existing_ratings()
 
 # =========================================================
-# 4. HELPER LOGIC
+# 3. HELPER FUNCTIONS
 # =========================================================
 
 def get_nemotron_row_id(master_df, current_incorrect):
     """
-    Calculates the Row ID based on Model B (Nemotron).
-    Formula: Excel Row = Pandas Index + 2 (Header + 0-index)
+    Finds the row number of the 'Nemotron' (id=B) version of this sentence.
+    This serves as the unique 'submission_id' for the whole set.
     """
     mask = (master_df["incorrect"] == current_incorrect) & (master_df["id"] == "B")
     subset = master_df[mask]
     if not subset.empty:
+        # Returns Excel Row Number (Index + 2)
         return subset.index[0] + 2
     return "Unknown"
 
 def get_saved_rating(m_id, u_idx):
-    """Retrieves a saved rating from session state for pre-filling the UI."""
     df = st.session_state.existing_data.get(m_id)
     if df is not None and not df.empty:
-        # Check if columns exist
         if "unique_set_index" in df.columns and "user" in df.columns:
-            # Filter for current User AND current Sentence Index
             mask = (df["unique_set_index"].astype(str) == str(u_idx)) & \
                    (df["user"] == st.session_state.username)
             match = df[mask]
@@ -141,31 +117,35 @@ def get_saved_rating(m_id, u_idx):
 
 def save_entry_to_sheet(sheet_key, tab_name, new_entry_df, u_idx):
     """
-    Generic function to Upsert (Update or Insert) data to GSheets.
-    Prevents duplicate rows for the same user+sentence.
+    Upserts data while STRICTLY enforcing column schema.
     """
     try:
-        # Get current data from memory
         existing_df = st.session_state.existing_data.get(sheet_key)
         
+        # 1. CLEAN EXISTING DATA (Safety Step)
+        # If existing data somehow got polluted with 'incorrect' columns, ignore them
+        allowed_cols = ["submission_id", "user", "unique_set_index", "rating", "timestamp", "user_corrected"]
+        
         if existing_df is not None and not existing_df.empty:
-            # 1. Identify if row exists
-            mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
-                   (existing_df["user"] == st.session_state.username)
-            
-            # 2. If exists, delete old row. If not, keep all.
-            if mask.any():
+            # Filter existing DF to only keep relevant columns if they exist
+            valid_existing_cols = [c for c in existing_df.columns if c in allowed_cols]
+            existing_df = existing_df[valid_existing_cols]
+
+            # Remove old entry for this user/sentence
+            if "unique_set_index" in existing_df.columns and "user" in existing_df.columns:
+                mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
+                       (existing_df["user"] == st.session_state.username)
                 existing_df = existing_df[~mask]
             
-            # 3. Append new entry
+            # Combine
             updated_df = pd.concat([existing_df, new_entry_df], ignore_index=True)
         else:
             updated_df = new_entry_df
 
-        # 4. Write to Google Sheets
+        # 2. WRITE TO SHEET
         conn.update(worksheet=tab_name, data=updated_df)
         
-        # 5. Update Memory
+        # 3. UPDATE SESSION STATE
         st.session_state.existing_data[sheet_key] = updated_df
         return True
         
@@ -174,131 +154,96 @@ def save_entry_to_sheet(sheet_key, tab_name, new_entry_df, u_idx):
         return False
 
 # =========================================================
-# 5. MAIN UI LAYOUT
+# 4. UI
 # =========================================================
 
 if "u_index" not in st.session_state:
     st.session_state.u_index = 0
 
-# Check bounds
 if st.session_state.u_index >= len(unique_list):
-    st.success("🎉 You have completed all evaluations!")
-    if st.button("Start Over"):
+    st.success("All done!")
+    if st.button("Restart"):
         st.session_state.u_index = 0
         st.rerun()
     st.stop()
 
-# Get Current Sentence Data
 current_incorrect = unique_list[st.session_state.u_index]
 versions = master_df[master_df["incorrect"] == current_incorrect]
 
-# --- Header & Progress ---
-st.markdown(f"### Evaluation Portal | User: **{st.session_state.username}**")
+st.markdown(f"### User: {st.session_state.username}")
 st.progress((st.session_state.u_index + 1) / len(unique_list))
 
-# --- Navigation Bar ---
+# Navigation
 c1, c2, c3 = st.columns([1, 6, 1])
-with c1:
-    if st.button("⬅️ Previous") and st.session_state.u_index > 0:
-        st.session_state.u_index -= 1
-        st.rerun()
-with c2:
-    st.markdown(f"<div style='text-align: center; font-weight: bold;'>Sentence {st.session_state.u_index + 1} of {len(unique_list)}</div>", unsafe_allow_html=True)
-with c3:
-    if st.button("Next ➡️") and st.session_state.u_index < len(unique_list) - 1:
-        st.session_state.u_index += 1
-        st.rerun()
+if c1.button("⬅️ Prev") and st.session_state.u_index > 0:
+    st.session_state.u_index -= 1
+    st.rerun()
+c2.markdown(f"<center><b>Sentence {st.session_state.u_index + 1}</b></center>", unsafe_allow_html=True)
+if c3.button("Next ➡️") and st.session_state.u_index < len(unique_list) - 1:
+    st.session_state.u_index += 1
+    st.rerun()
 
-# --- Content Display ---
-st.info(f"**Original Text:** {current_incorrect}")
+st.info(f"**Original:** {current_incorrect}")
 st.divider()
 
-# --- Rating Grid ---
+# Ratings
 model_ids = sorted(MODEL_TAB_NAMES.keys())
 rating_options = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-# Display in 2 rows of 3 columns
 rows = [model_ids[:3], model_ids[3:]]
-
 for row_ids in rows:
     cols = st.columns(3)
     for i, m_id in enumerate(row_ids):
         with cols[i]:
             m_row = versions[versions["id"] == m_id]
             if not m_row.empty:
-                # Header
-                st.markdown(f"**Model {m_id}** ({MODEL_TAB_NAMES[m_id]})")
-                
-                # Model Output Text
+                st.markdown(f"**{MODEL_TAB_NAMES[m_id].capitalize()}**")
                 st.success(m_row.iloc[0]["corrected"])
                 
-                # Dynamic Key for Widgets
-                widget_key = f"pills_{m_id}_{st.session_state.u_index}"
+                key = f"pills_{m_id}_{st.session_state.u_index}"
+                if key not in st.session_state:
+                    saved = get_saved_rating(m_id, st.session_state.u_index)
+                    if saved: st.session_state[key] = saved
                 
-                # Pre-fill Logic
-                if widget_key not in st.session_state:
-                    saved_val = get_saved_rating(m_id, st.session_state.u_index)
-                    if saved_val:
-                        st.session_state[widget_key] = saved_val
-                
-                # 1-10 Input Widget
-                st.pills(
-                    "Rating",
-                    options=rating_options,
-                    key=widget_key,
-                    label_visibility="collapsed"
-                )
+                st.pills("Rate", rating_options, key=key, label_visibility="collapsed")
 
 st.divider()
+manual_fix = st.text_area("Correction (Optional):", key=f"fix_{st.session_state.u_index}")
 
-# --- Manual Correction ---
-correction_key = f"correction_{st.session_state.u_index}"
-manual_fix = st.text_area("Suggest a better correction (Optional):", key=correction_key)
-
-# --- Submit Logic ---
-if st.button("💾 Save & Next", type="primary", use_container_width=True):
-    
-    with st.spinner("Saving data..."):
-        # 1. Prepare Metadata
-        nem_row = get_nemotron_row_id(master_df, current_incorrect)
-        custom_sub_id = f"{nem_row}_{st.session_state.u_index}"
+if st.button("Save Ratings", type="primary", use_container_width=True):
+    with st.spinner("Saving clean data..."):
+        # Calculate ID: Nemotron Row Number
+        nem_row_id = get_nemotron_row_id(master_df, current_incorrect)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # 2. Loop through models and save
+        
+        # SAVE RATINGS
         for m_id in model_ids:
-            # Get value from widget state
-            rating_val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
-            
-            if rating_val is not None:
-                new_entry = pd.DataFrame([{
-                    "submission_id": custom_sub_id,
-                    "user": st.session_state.username,
+            val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
+            if val is not None:
+                # STRICT DATAFRAME CREATION
+                # We define ONLY the columns we want. No 'incorrect' or 'corrected' text here.
+                clean_entry = pd.DataFrame([{
+                    "submission_id": int(nem_row_id) if nem_row_id != "Unknown" else 0,
+                    "user": str(st.session_state.username),
                     "unique_set_index": int(st.session_state.u_index),
-                    "rating": int(rating_val),
+                    "rating": int(val),
                     "timestamp": ts
                 }])
-                
-                # Save to specific model sheet
-                save_entry_to_sheet(m_id, MODEL_TAB_NAMES[m_id], new_entry, st.session_state.u_index)
-
-        # 3. Save Manual Correction (if exists)
+                save_entry_to_sheet(m_id, MODEL_TAB_NAMES[m_id], clean_entry, st.session_state.u_index)
+        
+        # SAVE MANUAL FIX
         if manual_fix:
-            user_entry = pd.DataFrame([{
-                "submission_id": custom_sub_id,
-                "user": st.session_state.username,
+            clean_user_entry = pd.DataFrame([{
+                "submission_id": int(nem_row_id) if nem_row_id != "Unknown" else 0,
+                "user": str(st.session_state.username),
                 "unique_set_index": int(st.session_state.u_index),
-                "user_corrected": manual_fix,
+                "user_corrected": str(manual_fix),
                 "timestamp": ts
             }])
-            save_entry_to_sheet("corrections", USER_CORRECTION_TAB_NAME, user_entry, st.session_state.u_index)
+            save_entry_to_sheet("corrections", USER_CORRECTION_TAB_NAME, clean_user_entry, st.session_state.u_index)
 
-    st.success("Saved successfully!")
+    st.success("Saved!")
     time.sleep(0.5)
-    
-    # Auto-Advance
     if st.session_state.u_index < len(unique_list) - 1:
         st.session_state.u_index += 1
         st.rerun()
-    else:
-        st.balloons()
-        st.success("All done!")
