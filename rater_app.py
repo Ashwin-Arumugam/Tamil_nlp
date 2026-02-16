@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from streamlit_gsheets import GSheetsConnection
-from datetime import datetime
 import time
 
 # =========================================================
@@ -98,11 +97,14 @@ def get_nemotron_row_id(master_df, current_incorrect):
         return subset.index[0] + 2
     return "Unknown"
 
-def get_saved_rating(m_id, u_idx):
+def get_saved_rating(m_id, sub_id):
+    """
+    Retrieves saved rating using submission_id (Row ID) instead of unique_set_index.
+    """
     df = st.session_state.existing_data.get(m_id)
     if df is not None and not df.empty:
-        if "unique_set_index" in df.columns and "user" in df.columns:
-            mask = (df["unique_set_index"].astype(str) == str(u_idx)) & \
+        if "submission_id" in df.columns and "user" in df.columns:
+            mask = (df["submission_id"].astype(str) == str(sub_id)) & \
                    (df["user"] == st.session_state.username)
             match = df[mask]
             if not match.empty:
@@ -112,25 +114,25 @@ def get_saved_rating(m_id, u_idx):
                     return None
     return None
 
-def save_entry_to_sheet(sheet_key, tab_name, new_entry_df, u_idx):
+def save_entry_to_sheet(sheet_key, tab_name, new_entry_df, sub_id):
     """
-    Upserts data: Removes old entry for this user/sentence,
+    Upserts data: Removes old entry for this user/submission_id,
     then adds the NEW entry to the TOP of the dataframe.
     """
     try:
         existing_df = st.session_state.existing_data.get(sheet_key)
         
-        # Define allowed columns (Strict Schema)
-        allowed_cols = ["submission_id", "user", "unique_set_index", "rating", "timestamp", "user_corrected"]
+        # Define allowed columns (Removed timestamp & unique_set_index)
+        allowed_cols = ["submission_id", "user", "rating", "user_corrected"]
         
         if existing_df is not None and not existing_df.empty:
             # Filter existing DF to only keep relevant columns
             valid_existing_cols = [c for c in existing_df.columns if c in allowed_cols]
             existing_df = existing_df[valid_existing_cols]
 
-            # Remove OLD entry for this user/sentence (De-duplication)
-            if "unique_set_index" in existing_df.columns and "user" in existing_df.columns:
-                mask = (existing_df["unique_set_index"].astype(str) == str(u_idx)) & \
+            # Remove OLD entry for this user/submission_id (De-duplication)
+            if "submission_id" in existing_df.columns and "user" in existing_df.columns:
+                mask = (existing_df["submission_id"].astype(str) == str(sub_id)) & \
                        (existing_df["user"] == st.session_state.username)
                 existing_df = existing_df[~mask]
             
@@ -166,6 +168,7 @@ if st.session_state.u_index >= len(unique_list):
 
 current_incorrect = unique_list[st.session_state.u_index]
 versions = master_df[master_df["incorrect"] == current_incorrect]
+nem_row_id = get_nemotron_row_id(master_df, current_incorrect)
 
 st.markdown(f"### User: {st.session_state.username}")
 st.progress((st.session_state.u_index + 1) / len(unique_list))
@@ -175,7 +178,7 @@ c1, c2, c3 = st.columns([1, 6, 1])
 if c1.button("⬅️ Prev") and st.session_state.u_index > 0:
     st.session_state.u_index -= 1
     st.rerun()
-c2.markdown(f"<center><b>Sentence {st.session_state.u_index + 1}</b></center>", unsafe_allow_html=True)
+c2.markdown(f"<center><b>Sentence {st.session_state.u_index + 1} (ID: {nem_row_id})</b></center>", unsafe_allow_html=True)
 if c3.button("Next ➡️") and st.session_state.u_index < len(unique_list) - 1:
     st.session_state.u_index += 1
     st.rerun()
@@ -199,7 +202,8 @@ for row_ids in rows:
                 
                 key = f"pills_{m_id}_{st.session_state.u_index}"
                 if key not in st.session_state:
-                    saved = get_saved_rating(m_id, st.session_state.u_index)
+                    # Retrieve using nem_row_id instead of index
+                    saved = get_saved_rating(m_id, nem_row_id)
                     if saved: st.session_state[key] = saved
                 
                 st.pills("Rate", rating_options, key=key, label_visibility="collapsed")
@@ -208,35 +212,28 @@ st.divider()
 manual_fix = st.text_area("Correction (Optional):", key=f"fix_{st.session_state.u_index}")
 
 if st.button("Save Ratings", type="primary", use_container_width=True):
-    with st.spinner("Saving clean data..."):
-        # Calculate ID: Nemotron Row Number
-        nem_row_id = get_nemotron_row_id(master_df, current_incorrect)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with st.spinner("Saving data..."):
         
         # SAVE RATINGS
         for m_id in model_ids:
             val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
             if val is not None:
-                # STRICT DATAFRAME CREATION
+                # STRICT DATAFRAME CREATION (No timestamp, No unique_set_index)
                 clean_entry = pd.DataFrame([{
                     "submission_id": int(nem_row_id) if nem_row_id != "Unknown" else 0,
                     "user": str(st.session_state.username),
-                    "unique_set_index": int(st.session_state.u_index),
-                    "rating": int(val),
-                    "timestamp": ts
+                    "rating": int(val)
                 }])
-                save_entry_to_sheet(m_id, MODEL_TAB_NAMES[m_id], clean_entry, st.session_state.u_index)
+                save_entry_to_sheet(m_id, MODEL_TAB_NAMES[m_id], clean_entry, nem_row_id)
         
         # SAVE MANUAL FIX
         if manual_fix:
             clean_user_entry = pd.DataFrame([{
                 "submission_id": int(nem_row_id) if nem_row_id != "Unknown" else 0,
                 "user": str(st.session_state.username),
-                "unique_set_index": int(st.session_state.u_index),
-                "user_corrected": str(manual_fix),
-                "timestamp": ts
+                "user_corrected": str(manual_fix)
             }])
-            save_entry_to_sheet("corrections", USER_CORRECTION_TAB_NAME, clean_user_entry, st.session_state.u_index)
+            save_entry_to_sheet("corrections", USER_CORRECTION_TAB_NAME, clean_user_entry, nem_row_id)
 
     st.success("Saved!")
     time.sleep(0.5)
