@@ -3,10 +3,6 @@ import pandas as pd
 from streamlit_gsheets import GSheetsConnection
 import time
 
-# =========================================================
-# 1. CONFIGURATION & CSS
-# =========================================================
-
 st.set_page_config(page_title="Model Eval Tool", layout="wide")
 
 st.markdown(
@@ -14,16 +10,18 @@ st.markdown(
     <style>
     div[data-testid="stPills"] > div {
         flex-wrap: nowrap !important;
-        gap: 2px !important; 
-        overflow-x: auto !important; 
-        padding-bottom: 4px; 
+        gap: 2px !important;
+        overflow-x: auto !important;
+        padding-bottom: 4px;
     }
+
     div[data-testid="stPills"] button {
-        padding: 2px 6px !important; 
-        min-width: 30px !important; 
+        padding: 2px 6px !important;
+        min-width: 30px !important;
         min-height: 32px !important;
         font-size: 14px !important;
     }
+
     div[data-testid="stPills"] button p {
         margin: 0px !important;
         padding: 0px !important;
@@ -32,6 +30,8 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
+MASTER_SHEET_GID = 1905633307
 
 MODEL_TAB_NAMES = {
     "A": "qwen",
@@ -44,11 +44,8 @@ MODEL_TAB_NAMES = {
 
 RATING_COLS = ["submission_id", "user", "rating", "reason"]
 CORRECTION_COLS = ["submission_id", "user", "user_corrected"]
-REASON_OPTIONS = ["spelling error", "not fluent enough", "grammar error"]
 
-# =========================================================
-# 2. STATE MANAGEMENT & LOADING
-# =========================================================
+REASON_OPTIONS = ["spelling error", "not fluent enough", "grammar error"]
 
 if "username" not in st.session_state:
     st.title("Tamil NLP grammar correction")
@@ -68,218 +65,401 @@ if "local_dfs" not in st.session_state:
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_master_data(_conn):
-    df = _conn.read(worksheet=0, ttl=0) 
+    df = _conn.read(worksheet=0, ttl=0)
     if df is None or df.empty:
-        st.error("Master sheet is empty.")
+        st.error("Master sheet is empty or could not be loaded.")
         st.stop()
     df = df.dropna(how="all")
     unique_sentences = df["incorrect"].unique().tolist()
     return df, unique_sentences
 
 def clean_rating_df(df):
-    if df is None or df.empty: return pd.DataFrame(columns=RATING_COLS)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=RATING_COLS)
+
+    if "submission_id" in df.columns:
+        df = df.dropna(subset=["submission_id"])
+
+    for col in RATING_COLS:
+        if col not in df.columns:
+            df[col] = None
+
     df["submission_id"] = df["submission_id"].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
     df = df[~df["submission_id"].isin(["", "None", "nan"])]
-    df["rating"] = pd.to_numeric(df["rating"], errors='coerce').fillna(0).astype(int)
+
+    df["user"] = df["user"].astype(str).str.strip()
+
+    df["rating"] = pd.to_numeric(df["rating"], errors='coerce')
+    df = df.dropna(subset=["rating"])
+    df["rating"] = df["rating"].astype(int)
+
+    df["reason"] = df["reason"].fillna("").astype(str)
+    df["reason"] = df["reason"].replace(["nan", "None"], "")
+
     return df[RATING_COLS]
+
+def clean_correction_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=CORRECTION_COLS)
+
+    if "submission_id" in df.columns:
+        df = df.dropna(subset=["submission_id"])
+
+    for col in CORRECTION_COLS:
+        if col not in df.columns:
+            df[col] = None
+
+    df["submission_id"] = df["submission_id"].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    df = df[~df["submission_id"].isin(["", "None", "nan"])]
+    df["user"] = df["user"].astype(str).str.strip()
+
+    return df[CORRECTION_COLS]
 
 def load_all_tabs_into_variables(_conn):
     for m_id, tab_name in MODEL_TAB_NAMES.items():
         try:
             df = _conn.read(worksheet=tab_name, ttl=0)
             st.session_state.local_dfs[m_id] = clean_rating_df(df)
-        except:
+        except Exception as e:
+            st.error(f"Error loading tab '{tab_name}': {e}")
             st.session_state.local_dfs[m_id] = pd.DataFrame(columns=RATING_COLS)
+
     try:
         df = _conn.read(worksheet="user_corrections", ttl=0)
-        st.session_state.local_dfs["corrections"] = df
-    except:
+        st.session_state.local_dfs["corrections"] = clean_correction_df(df)
+    except Exception as e:
         st.session_state.local_dfs["corrections"] = pd.DataFrame(columns=CORRECTION_COLS)
 
 if not st.session_state.local_dfs:
-    load_all_tabs_into_variables(st.session_state.conn)
+    with st.spinner("Initializing variables from cloud..."):
+        load_master_data(st.session_state.conn)
+        load_all_tabs_into_variables(st.session_state.conn)
 
 master_df, unique_list = load_master_data(st.session_state.conn)
 
-# =========================================================
-# 3. HELPER FUNCTIONS (Updated Locking Logic)
-# =========================================================
-
-def is_locked_for_user(m_id, sub_id):
-    """
-    Logic:
-    - 0 raters: Unlocked
-    - 1 rater: Locked ONLY for that specific rater. Unlocked for everyone else.
-    - 2+ raters: Unlocked for EVERYONE (UI unlocks completely).
-    """
-    df = st.session_state.local_dfs.get(m_id)
-    if df is not None and not df.empty:
-        match = df[df["submission_id"] == str(sub_id)]
-        raters = match["user"].unique().tolist()
-        
-        if len(raters) == 1:
-            # If I am the only one who rated, I am locked until someone else joins
-            if st.session_state.username in raters:
-                return True
-        
-        if len(raters) >= 2:
-            return False # Fully unlocked for everyone
-            
-    return False
+def get_model_specific_row_id(master_df, current_incorrect, model_id):
+    mask = (master_df["incorrect"] == current_incorrect) & (master_df["id"] == model_id)
+    subset = master_df[mask]
+    if not subset.empty:
+        return str(subset.index[0] + 2)
+    return None
 
 def get_all_previous_ratings(m_id, sub_id):
     df = st.session_state.local_dfs.get(m_id)
     if df is not None and not df.empty:
-        match = df[df["submission_id"] == str(sub_id)]
+        mask = (df["submission_id"] == str(sub_id))
+        match = df[mask]
         if not match.empty:
-            ratings = [f"{row['user']} ({int(row['rating'])})" for _, row in match.iterrows() if row['rating'] > 0]
-            return ", ".join(ratings)
+            valid_matches = match[pd.to_numeric(match['rating'], errors='coerce').notnull()]
+            if not valid_matches.empty:
+                ratings = [f"{row['user']} ({int(row['rating'])})" for _, row in valid_matches.iterrows()]
+                return ", ".join(ratings)
     return ""
+
+def is_locked_for_user(m_id, sub_id, username):
+    """
+    Returns True if the current user should be locked out of rating.
+    - If >= 2 total raters: Unlocked (False) for EVERYONE, enabling edits.
+    - If 1 rater and it IS the current user: Locked (True).
+    - If 0 raters or 1 rater (but a different user): Unlocked (False).
+    """
+    df = st.session_state.local_dfs.get(m_id)
+    if df is not None and not df.empty:
+        mask = (df["submission_id"] == str(sub_id))
+        match = df[mask]
+        
+        if not match.empty:
+            raters = match["user"].unique().tolist()
+            
+            if len(raters) >= 2:
+                return False 
+            if len(raters) == 1 and username in raters:
+                return True 
+                
+    return False
 
 def get_existing_rating(m_id, sub_id):
     df = st.session_state.local_dfs.get(m_id)
     if df is not None and not df.empty:
-        match = df[(df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)]
-        if not match.empty: return int(match.iloc[0]["rating"])
+        mask = (df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)
+        match = df[mask]
+        if not match.empty:
+            try:
+                val = int(match.iloc[0]["rating"])
+                return val if val > 0 else None
+            except:
+                return None
     return None
 
 def get_existing_reason(m_id, sub_id):
     df = st.session_state.local_dfs.get(m_id)
     if df is not None and not df.empty:
-        match = df[(df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)]
+        mask = (df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)
+        match = df[mask]
         if not match.empty:
-            r = str(match.iloc[0]["reason"])
-            return [x.strip() for x in r.split(",") if x.strip() in REASON_OPTIONS]
+            reason_str = str(match.iloc[0]["reason"])
+            if reason_str and reason_str not in ["nan", "None", ""]:
+                return [r.strip() for r in reason_str.split(",") if r.strip() in REASON_OPTIONS]
     return []
+
+def get_existing_correction(sub_id):
+    df = st.session_state.local_dfs.get("corrections")
+    if df is not None and not df.empty:
+        mask = (df["submission_id"] == str(sub_id)) & (df["user"] == st.session_state.username)
+        match = df[mask]
+        if not match.empty:
+            return str(match.iloc[0]["user_corrected"])
+    return ""
 
 def update_local_variable(key, new_row_df, sub_id):
     current_df = st.session_state.local_dfs.get(key)
     if current_df is not None and not current_df.empty:
-        mask = (current_df["submission_id"] == str(sub_id)) & (current_df["user"] == st.session_state.username)
+        mask = (current_df["submission_id"] == str(sub_id)) & \
+               (current_df["user"] == st.session_state.username)
         current_df = current_df[~mask]
-    st.session_state.local_dfs[key] = pd.concat([new_row_df, current_df], ignore_index=True)
+    else:
+        if key == "corrections":
+            current_df = pd.DataFrame(columns=CORRECTION_COLS)
+        else:
+            current_df = pd.DataFrame(columns=RATING_COLS)
+
+    updated_df = pd.concat([new_row_df, current_df], ignore_index=True)
+    st.session_state.local_dfs[key] = updated_df
 
 def save_to_local_memory(current_incorrect, versions):
-    for m_id in MODEL_TAB_NAMES.keys():
-        m_row = versions[versions["id"] == m_id]
-        if m_row.empty: continue
-        sub_id = str(m_row.index[0] + 2)
-        
-        if is_locked_for_user(m_id, sub_id): continue # Skip saving if locked
-        
-        val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
-        if val:
-            reason_list = st.session_state.get(f"reason_{m_id}_{st.session_state.u_index}", [])
-            new_row = pd.DataFrame([{"submission_id": sub_id, "user": st.session_state.username, "rating": val, "reason": ",".join(reason_list)}])
-            update_local_variable(m_id, new_row, sub_id)
+    model_ids = sorted(MODEL_TAB_NAMES.keys())
 
-    # Correction logic
-    fix = st.session_state.get(f"fix_{st.session_state.u_index}")
-    if fix and not versions.empty:
-        sub_id = str(versions.index[0] + 2)
-        new_row = pd.DataFrame([{"submission_id": sub_id, "user": st.session_state.username, "user_corrected": fix}])
-        update_local_variable("corrections", new_row, sub_id)
+    is_locked_by_state = False
+    for m_id in model_ids:
+        m_row = versions[versions["id"] == m_id]
+        if not m_row.empty:
+            specific_sub_id = str(m_row.index[0] + 2)
+            if is_locked_for_user(m_id, specific_sub_id, st.session_state.username):
+                is_locked_by_state = True
+                break
+
+    if is_locked_by_state:
+        return
+
+    for m_id in model_ids:
+        val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
+        if val is not None:
+            current_model_row_id = get_model_specific_row_id(master_df, current_incorrect, m_id)
+            if current_model_row_id:
+                reason_key = f"reason_{m_id}_{st.session_state.u_index}"
+                reason_list = st.session_state.get(reason_key, [])
+                reason_str = ", ".join(reason_list) if (val <= 7 and reason_list) else ""
+
+                new_row = pd.DataFrame([{
+                    "submission_id": str(current_model_row_id),
+                    "user": str(st.session_state.username),
+                    "rating": int(val),
+                    "reason": reason_str
+                }])
+                update_local_variable(m_id, new_row, current_model_row_id)
+
+    manual_fix_val = st.session_state.get(f"fix_{st.session_state.u_index}")
+    if manual_fix_val and manual_fix_val.strip() != "":
+        if not versions.empty:
+            general_sub_id = str(versions.index[0] + 2)
+            user_row = pd.DataFrame([{
+                "submission_id": str(general_sub_id),
+                "user": str(st.session_state.username),
+                "user_corrected": str(manual_fix_val)
+            }])
+            update_local_variable("corrections", user_row, general_sub_id)
 
 def sync_to_cloud():
-    save_bar = st.progress(0, text="Syncing...")
-    for i, (key, df) in enumerate(st.session_state.local_dfs.items()):
-        tab = MODEL_TAB_NAMES.get(key, "user_corrections" if key == "corrections" else None)
-        if tab and not df.empty:
-            st.session_state.conn.update(worksheet=tab, data=df)
-            time.sleep(0.5)
-        save_bar.progress((i+1)/len(st.session_state.local_dfs))
+    save_bar = st.progress(0, text="Syncing to cloud...")
+    model_ids = sorted(MODEL_TAB_NAMES.keys())
+    total_tabs = len(model_ids) + 1
+    current_tab = 0
+
+    for key, df in st.session_state.local_dfs.items():
+        if not df.empty:
+            if key in MODEL_TAB_NAMES:
+                tab_name = MODEL_TAB_NAMES[key]
+            elif key == "corrections":
+                tab_name = "user_corrections"
+            else:
+                continue
+
+            save_bar.progress((current_tab / total_tabs), text=f"Writing {tab_name}...")
+            try:
+                st.session_state.conn.update(worksheet=tab_name, data=df)
+                time.sleep(1.0)
+            except Exception as e:
+                st.error(f"Failed to write {tab_name}: {e}")
+
+            current_tab += 1
+
+    save_bar.progress(1.0, text="Sync complete.")
+    time.sleep(1.0)
     save_bar.empty()
 
-# =========================================================
-# 4. MAIN UI
-# =========================================================
+def get_first_unrated_index(unique_list, master_df):
+    for idx, sentence in enumerate(unique_list):
+        versions = master_df[master_df["incorrect"] == sentence]
+        for m_id in MODEL_TAB_NAMES.keys():
+            m_row = versions[versions["id"] == m_id]
+            if not m_row.empty:
+                specific_sub_id = str(m_row.index[0] + 2)
+
+                df = st.session_state.local_dfs.get(m_id)
+                is_rated_by_anyone = False
+
+                if df is not None and not df.empty:
+                    if (df["submission_id"] == specific_sub_id).any():
+                        is_rated_by_anyone = True
+
+                if not is_rated_by_anyone:
+                    return idx
+
+    return len(unique_list)
 
 if "u_index" not in st.session_state:
-    st.session_state.u_index = 0
+    st.session_state.u_index = get_first_unrated_index(unique_list, master_df)
 
 top_c1, top_c2 = st.columns([8, 2])
-with top_c1: st.markdown(f"👤 Name: **{st.session_state.username}**")
+with top_c1:
+    st.markdown(f"Name: **{st.session_state.username}**")
 with top_c2:
-    if st.button("Save & Exit", type="primary"):
-        save_to_local_memory(unique_list[st.session_state.u_index], master_df[master_df["incorrect"] == unique_list[st.session_state.u_index]])
+    if st.button("Save & Exit", type="primary", use_container_width=True):
+        if st.session_state.u_index < len(unique_list):
+            current_incorrect = unique_list[st.session_state.u_index]
+            versions = master_df[master_df["incorrect"] == current_incorrect]
+            save_to_local_memory(current_incorrect, versions)
+
         sync_to_cloud()
         st.session_state.clear()
+        st.cache_data.clear()
         st.rerun()
 
 st.divider()
 
 if st.session_state.u_index >= len(unique_list):
-    st.success("🎉 All sentences evaluated!")
+    st.success("You have reached the end. Please click Save & Exit above to upload your evaluations.")
     st.stop()
 
 current_incorrect = unique_list[st.session_state.u_index]
 versions = master_df[master_df["incorrect"] == current_incorrect]
 
-# Check if the overall sentence is locked for this user
-is_sentence_locked = False
+is_locked_by_state = False
 for m_id in MODEL_TAB_NAMES.keys():
     m_row = versions[versions["id"] == m_id]
-    if not m_row.empty and is_locked_for_user(m_id, str(m_row.index[0] + 2)):
-        is_sentence_locked = True
-        break
+    if not m_row.empty:
+        if is_locked_for_user(m_id, str(m_row.index[0] + 2), st.session_state.username):
+            is_locked_by_state = True
+            break
 
 st.markdown(f"<center><h4>Sentence {st.session_state.u_index + 1} of {len(unique_list)}</h4></center>", unsafe_allow_html=True)
 
-if is_sentence_locked:
-    st.info("ℹ️ Your rating is submitted. Editing is locked until a second person annotates this sentence. Once 2+ ratings exist, it will unlock for everyone.")
+if is_locked_by_state:
+    st.info("You have submitted your rating. Modifications are locked pending a second annotator's review. Once 2 annotations are complete, modifications will be fully unlocked.")
 
 st.info(f"**Original:** {current_incorrect}")
+st.divider()
 
 model_ids = sorted(MODEL_TAB_NAMES.keys())
-rows = [model_ids[:3], model_ids[3:]]
+rating_options = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-for row_ids in rows:
+rows = [model_ids[:3], model_ids[3:]]
+for row_idx, row_ids in enumerate(rows):
     cols = st.columns(3)
     for i, m_id in enumerate(row_ids):
         with cols[i]:
             m_row = versions[versions["id"] == m_id]
             if not m_row.empty:
-                sub_id = str(m_row.index[0] + 2)
-                st.markdown(f"**{m_id}**")
+                specific_sub_id = str(m_row.index[0] + 2)
+
+                st.markdown(f"**{m_id}** <span style='color:red'>*</span>", unsafe_allow_html=True)
                 st.success(m_row.iloc[0]["corrected"])
-                
-                # Previous ratings are ALWAYS visible
-                prev = get_all_previous_ratings(m_id, sub_id)
-                if prev: st.caption(f"Ratings: {prev}")
-                
+
+                all_prev_ratings = get_all_previous_ratings(m_id, specific_sub_id)
+                is_locked_for_this_model = is_locked_for_user(m_id, specific_sub_id, st.session_state.username)
+
+                if all_prev_ratings:
+                    st.caption(f"**Previous Ratings:** {all_prev_ratings}")
+
                 key = f"pills_{m_id}_{st.session_state.u_index}"
                 if key not in st.session_state:
-                    st.session_state[key] = get_existing_rating(m_id, sub_id)
-                
-                # Input is disabled if locked for this user
-                lock = is_locked_for_user(m_id, sub_id)
-                sel = st.pills("Rate", range(1, 11), key=key, disabled=lock, label_visibility="collapsed")
-                
-                if sel and sel <= 7:
-                    r_key = f"reason_{m_id}_{st.session_state.u_index}"
-                    if r_key not in st.session_state:
-                        st.session_state[r_key] = get_existing_reason(m_id, sub_id)
-                    st.multiselect("Why?", REASON_OPTIONS, key=r_key, disabled=lock)
+                    saved_val = get_existing_rating(m_id, specific_sub_id)
+                    if saved_val:
+                        st.session_state[key] = saved_val
+
+                selected_rating = st.pills("Rate", rating_options, key=key, label_visibility="collapsed", disabled=is_locked_for_this_model)
+
+                if selected_rating is not None and selected_rating <= 7:
+                    reason_key = f"reason_{m_id}_{st.session_state.u_index}"
+
+                    if reason_key not in st.session_state:
+                        saved_reason = get_existing_reason(m_id, specific_sub_id)
+                        st.session_state[reason_key] = saved_reason
+
+                    st.multiselect(
+                        "Why this rating?",
+                        options=REASON_OPTIONS,
+                        key=reason_key,
+                        disabled=is_locked_for_this_model
+                    )
+            else:
+                st.warning(f"No data for {m_id}")
+
+    if row_idx < len(rows) - 1:
+        st.markdown("<br><br>", unsafe_allow_html=True)
 
 st.divider()
-st.text_area("Correction (Optional):", key=f"fix_{st.session_state.u_index}", disabled=is_sentence_locked)
 
-# --- Navigation ---
+# Finishing the cut-off code from your snippet here
+general_sub_id = str(versions.index[0] + 2) if not versions.empty else None
+existing_correction = get_existing_correction(general_sub_id) if general_sub_id else ""
+st.text_area("Correction (Optional):", value=existing_correction, key=f"fix_{st.session_state.u_index}", disabled=is_locked_by_state)
+
+st.divider()
+
 b_c1, b_c2, b_c3, b_c4 = st.columns([2, 3, 2, 2])
+
 with b_c1:
-    if st.button("⬅️ Prev") and st.session_state.u_index > 0:
+    if st.button("Prev", use_container_width=True) and st.session_state.u_index > 0:
         save_to_local_memory(current_incorrect, versions)
         st.session_state.u_index -= 1
         st.rerun()
+
 with b_c2:
-    jump_val = st.number_input("Jump", 1, len(unique_list), st.session_state.u_index + 1, label_visibility="collapsed")
+    jump_val = st.number_input(
+        "Jump to sentence:",
+        min_value=1,
+        max_value=len(unique_list),
+        value=st.session_state.u_index + 1,
+        label_visibility="collapsed"
+    )
+
 with b_c3:
-    if st.button("🚀 Jump"):
-        save_to_local_memory(current_incorrect, versions)
-        st.session_state.u_index = jump_val - 1
-        st.rerun()
+    if st.button("Jump", use_container_width=True):
+        if jump_val - 1 != st.session_state.u_index:
+            save_to_local_memory(current_incorrect, versions)
+            st.session_state.u_index = jump_val - 1
+            st.rerun()
+
 with b_c4:
-    if st.button("Next ➡️"):
-        save_to_local_memory(current_incorrect, versions)
-        st.session_state.u_index += 1
-        st.rerun()
+    if st.button("Next", use_container_width=True):
+        all_rated = True
+        for m_id in MODEL_TAB_NAMES.keys():
+            m_row = versions[versions["id"] == m_id]
+            if not m_row.empty:
+                specific_sub_id = str(m_row.index[0] + 2)
+
+                if is_locked_for_user(m_id, specific_sub_id, st.session_state.username):
+                    continue
+
+                val = st.session_state.get(f"pills_{m_id}_{st.session_state.u_index}")
+                if val is None:
+                    all_rated = False
+                    break
+
+        if all_rated:
+            save_to_local_memory(current_incorrect, versions)
+            st.session_state.u_index += 1
+            st.rerun()
+        else:
+            st.toast("Please rate all displayed models before proceeding to the next sentence.")
